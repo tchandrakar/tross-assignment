@@ -1,0 +1,88 @@
+{
+  "profile": {
+    "entityUrn": "urn:li:fs_profile:ACoAAAExample",
+    "firstName": "Ada",
+    "lastName": "Lovelace",
+    "headline": "Mathematician | First Programmer",
+    "summary": "I write programs for the analytical engine.",
+    "industryName": "Computer Software",
+    "geoLocationName": "London, England, United Kingdom",
+    "geoCountryName": "United Kingdom",
+    "location": { "basicLocation": { "countryCode": "gb" } },
+    "miniProfile": {
+      "entityUrn": "urn:li:fs_miniProfile:ACoAAAExample",
+      "firstName": "Ada",
+      "lastName": "Lovelace",
+      "occupation": "Mathematician",
+      "publicIdentifier": "ada-lovelace",
+      "premium": true,
+      "picture": {
+        "com.linkedin.common.VectorImage": {
+          "rootUrl": "https://media.licdn.com/dms/image/ada/",
+          "artifacts": [
+            { "width": 100, "height": 100, "fileIdentifyingUrlPathSegment": "small.jpg", "expiresAt": 1767225600000 },
+            { "width": 800, "height": 800, "fileIdentifyingUrlPathSegment": "large.jpg", "expiresAt": 1767225600000 }
+          ]
+        }
+      }
+    }
+  },
+  "positionView": {
+    "elements": [
+      {
+        "title": "Principal Engineer",
+        "companyName": "Analytical Engines Ltd",
+        "employmentType": "FULL_TIME",
+        "locationName": "London, United Kingdom",
+        "description": "Designing computation.",
+        "timePeriod": { "startDate": { "month": 4, "year": 2021 } },
+        "company": {
+          "miniCompany": {
+            "name": "Analytical Engines Ltd",
+            "universalName": "analytical-engines",
+            "logo": {
+              "com.linkedin.common.VectorImage": {
+                "rootUrl": "https://media.licdn.com/dms/image/ae/",
+                "artifacts": [{ "width": 200, "height": 200, "fileIdentifyingUrlPathSegment": "logo.png" }]
+              }
+            }
+          }
+        }
+      },
+      {
+        "title": "Research Assistant",
+        "companyName": "Royal Society",
+        "timePeriod": { "startDate": { "month": 1, "year": 2018 }, "endDate": { "month": 3, "year": 2021 } }
+      }
+    ]
+  },
+  "educationView": {
+    "elements": [
+      {
+        "schoolName": "University of London",
+        "degreeName": "BSc",
+        "fieldOfStudy": "Mathematics",
+        "grade": "First Class",
+        "timePeriod": { "startDate": { "year": 2014 }, "endDate": { "year": 2018 } },
+        "school": { "schoolUniversalName": "university-of-london" }
+      }
+    ]
+  },
+  "skillView": { "elements": [{ "name": "Mathematics" }, { "name": "Algorithms" }] },
+  "certificationView": {
+    "elements": [
+      {
+        "name": "Certified Engine Operator",
+        "authority": "Royal Society",
+        "licenseNumber": "RS-001",
+        "url": "https://example.org/cert/1",
+        "timePeriod": { "startDate": { "month": 5, "year": 2020 } }
+      }
+    ]
+  },
+  "languageView": { "elements": [{ "name": "English", "proficiency": "NATIVE_OR_BILINGUAL" }] },
+  "projectView": { "elements": [] },
+  "publicationView": { "elements": [] },
+  "honorView": { "elements": [] },
+  "volunteerExperienceView": { "elements": [] }
+}
