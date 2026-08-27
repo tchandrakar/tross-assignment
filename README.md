@@ -27,51 +27,52 @@ curl "https://<host>/v1/profile?url=https://www.linkedin.com/in/williamhgates/"
 
 ## Quick start
 
-**Requirements:** Node.js ≥ 20 (developed on 25), and a LinkedIn account you're willing to use for the session cookie.
+**Requirements:** Node.js ≥ 20 (developed on 25), and a LinkedIn account you're willing to use.
 
 ```bash
 git clone https://github.com/tchandrakar/tross-assignment.git
 cd tross-assignment
 npm install
+npx playwright install chromium
 cp .env.example .env
 ```
 
-Then fill in `LI_AT` and `LI_JSESSIONID` (see below) and run:
+### Establishing a session
+
+Put your account's credentials in `.env` and run the login helper:
+
+```bash
+npm run login
+```
+
+A **visible** browser opens, logs in with human-paced typing, pauses if LinkedIn
+presents a CAPTCHA or emails you a code (clear it in the window), verifies the
+result against `/voyager/api/me`, and writes the session to `.sessions/`.
+
+Then start the API:
 
 ```bash
 npm run dev
 ```
 
-The API is on `http://localhost:8080`, with interactive docs at `http://localhost:8080/docs`.
+`http://localhost:8080`, docs at `/docs`.
 
-```bash
-npm test          # 86 unit tests, no network access required
-npm run typecheck # strict tsc
-npm run build     # compile to dist/
-```
+Once the session file exists you can delete `LI_PASSWORD` from `.env` — **the
+server never reads it.** Credentials are used only by the login helper, only to
+fill LinkedIn's own form, and are never logged or written to disk.
 
-### Getting the session cookies
+> `.sessions/*.json` is a live logged-in session. It is gitignored and written
+> mode `0600`. Treat it exactly like a password.
 
-The API authenticates as a logged-in LinkedIn member.
+#### Why login rather than pasting a cookie
 
-**Copy the whole `cookie:` header — not just `li_at`.** This is the single most important setup step, and getting it wrong causes a failure that looks like something else entirely (see below).
+The obvious approach — copy `li_at` out of DevTools and use it forever — does
+not work, and fails in a way that looks like something else.
 
-1. Log in to `linkedin.com` in a browser.
-2. DevTools → **Network** tab → click any request to `www.linkedin.com`.
-3. Under **Request Headers**, copy the entire value of `cookie:`.
-4. Paste it into `LI_COOKIES`:
-
-```bash
-LI_COOKIES='bcookie="v=2&abc..."; bscookie="v=1&..."; li_at=AQEDAS8...; JSESSIONID="ajax:1234567890123456789"; lidc="b=OB1:..."; li_gc=MTs...'
-```
-
-`li_at` and `JSESSIONID` are extracted from that string automatically. You can still set them individually via `LI_AT` / `LI_JSESSIONID`, but the session will be considerably shorter-lived.
-
-#### Why the whole jar matters
-
-**LinkedIn validates the *set* of cookies, not just the session cookie.** A bare `li_at` arriving without the browser-identity cookies that normally accompany it (`bcookie`, `bscookie`, `lidc`, `li_gc`) looks exactly like a cookie that has been lifted from a browser and replayed elsewhere — which is what it is.
-
-Observed directly while building this: with only `li_at` + `JSESSIONID`, four requests succeeded and the fifth came back as
+**LinkedIn rotates `li_at` on use and invalidates the previous value.** A pasted
+cookie is a point-in-time snapshot that goes stale within minutes. Replaying a
+superseded token is the signature of a stolen cookie, and LinkedIn responds by
+killing the session server-side:
 
 ```http
 HTTP/2 302
@@ -79,9 +80,24 @@ location: https://www.linkedin.com/voyager/api/me
 set-cookie: li_at=delete me; Expires=Thu, 01-Jan-1970 00:00:00 GMT; Max-Age=0
 ```
 
-That is not a rate limit and not an expiry — LinkedIn **invalidated the session server-side** and the cookie is unrecoverable. The API detects this specific response and reports it as a distinct `AUTH_FAILED` with `sessionInvalidated: true`, because the remedy is different from an ordinary auth-wall bounce: you need a fresh login, and retrying only burns the account further.
+That is not a rate limit and not an expiry — the cookie is unrecoverable, and
+re-copying from the same browser session cannot produce a live one. Observed
+directly during development: a freshly-pasted jar authenticated successfully and
+then returned `401` about a minute later from a new browser context, because the
+first request had already rotated the token and the new value was discarded with
+the context.
 
-`li_at` is a bearer credential for the entire account. Treat it exactly like a password: it is never committed, never logged (the logger redacts `cookie` headers), and in production it lives in Secret Manager rather than in the service config.
+So the fix is *persistence*, not better headers. The API stores the browser's
+storage state after every call and reloads it on the next one, following the
+rotation instead of fighting it. Cookie pasting is still supported via
+`LI_COOKIES` — it just acts as a one-time bootstrap seed rather than a
+permanent credential.
+
+```bash
+npm test          # 100 unit tests, no network access required
+npm run typecheck # strict tsc
+npm run build     # compile to dist/
+```
 
 ---
 
@@ -91,16 +107,19 @@ Every option is in [`.env.example`](.env.example). The ones that matter:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LINKEDIN_IDENTITIES` | — | JSON array of `{label, liAt, jsessionId, proxy?}`. The multi-account form. |
-| `LI_COOKIES` | — | A whole pasted `cookie:` header. `li_at` and `JSESSIONID` are extracted from it. **Preferred.** |
-| `LI_AT` / `LI_JSESSIONID` | — | Single-account shorthand, used only when `LINKEDIN_IDENTITIES` is empty. |
+| `LI_EMAIL` / `LI_PASSWORD` | — | Used **only** by `npm run login`. The server never reads them. |
+| `IDENTITY_LABEL` | `primary` | Names the identity, and keys its stored session. |
+| `SESSION_STATE_DIR` | `.sessions` | Where browser session state is persisted locally. |
+| `LI_COOKIES` | — | A pasted `cookie:` header, used as a one-time bootstrap seed. |
+| `LINKEDIN_IDENTITIES` | — | JSON array of `{label, liAt, jsessionId, cookies?, proxy?}` for multi-account setups. |
+| `ENABLE_BROWSER_FALLBACK` | `true` | The browser transport. Leave on. |
+| `ENABLE_HTTP_TRANSPORT` | `false` | Raw-HTTP Voyager. Off by default — it burns sessions (see [Approach](#approach)). |
 | `PROXY_URLS` | — | Comma-separated proxy URLs, assigned round-robin to identities. |
 | `PROXY_STICKY_TEMPLATE` | — | Proxy URL template with `{session}` for sticky-session providers. |
-| `GCS_BUCKET` | — | Blob-storage cache bucket. Falls back to an in-process LRU when unset. |
+| `GCS_BUCKET` | — | Blob bucket for the profile cache *and* session state. In-process LRU when unset. |
 | `CACHE_TTL_SECONDS` | `604800` (7d) | How long a cached profile is served before re-scraping. `0` = never expire. |
-| `SCRAPE_RATE_PER_MINUTE` | `5` | **Hard ceiling** on live LinkedIn fetches per minute. |
+| `SCRAPE_RATE_PER_MINUTE` | `5` | **Hard ceiling** on live LinkedIn fetches. |
 | `API_KEYS` | — | Comma-separated keys required as `x-api-key`. Unauthenticated when empty. |
-| `ENABLE_BROWSER_FALLBACK` | `true` | Whether to fall back to headless Chromium when Voyager is blocked. |
 
 ---
 
@@ -305,29 +324,64 @@ LinkedIn's GraphQL endpoints are addressed by `queryId` — an opaque hash of a 
 
 So extraction runs three strategies, most-reliable first:
 
-| # | Strategy | Endpoint | Notes |
+| # | Strategy | Transport | Notes |
 |---|---|---|---|
-| 1 | `voyager-graphql` | `/identity/dash/profiles` + `/graphql` profile cards | What the current web client uses. **Verified working against live LinkedIn.** Returns *rendering instructions* rather than data, so it needs more interpretation. |
-| 2 | `voyager-profile-view` | `/identity/profiles/{id}/profileView` | Legacy REST — one call returned *every* section, and took no `queryId`. **Returns `410 Gone` as of 2026-08** (see below). Kept because it's cheap to try, the retirement may be staged per-account, and it's by far the richest single response where it still works. |
-| 3 | `browser` | Headless Chromium on the public profile page | Real TLS fingerprint and JS execution. Slow and memory-hungry, so it's last. |
+| 1 | `browser-voyager` | Voyager called from inside an authenticated Chromium page | **Default.** Same endpoints, same parsers — the request simply carries Chrome's real TLS fingerprint, header ordering and cookie jar, because it genuinely is Chrome making a same-origin request. |
+| 2 | `voyager-graphql` | The same dash calls over raw HTTP (`undici`) | Faster and far cheaper, and the purest expression of "call the API directly". **Off by default** — see below. |
+| 3 | `voyager-profile-view` | Legacy REST, raw HTTP | One call returned *every* section and took no `queryId`. **Returns `410 Gone` as of 2026-08.** Retained because it costs one call to try and 410 is unambiguous. |
+| 4 | `browser` | Harvest payloads from the rendered profile page | Last resort. |
 
-> **Note on ordering.** `profileView` was built as strategy 1 — it is genuinely the better endpoint. Live testing then showed LinkedIn now returns `410 Gone` for both `/profileView` and `/networkinfo`, so the order was inverted. The endpoint is retained rather than deleted: 410 is cheap to discover, and a retired-endpoint response is unambiguous, unlike a silent schema change.
+> **Why raw HTTP is opt-in.** An HTTP client is trivially distinguishable from a
+> browser — different TLS/JA3 signature, different header ordering, no JS
+> execution. In testing, a raw client authenticated fine and then had its session
+> invalidated server-side within a handful of requests, while the browser
+> transport making the *identical* API calls kept working. Raw HTTP is preserved
+> behind `ENABLE_HTTP_TRANSPORT=true` because it is the more direct answer to
+> "reverse engineer the API", but it is not the default because it destroys the
+> credential it depends on.
 
-The chain distinguishes **three** failure modes, and the distinction is load-bearing:
+> **Note on ordering.** `profileView` was originally strategy 1 — it is
+> genuinely the better endpoint. Live testing showed LinkedIn now returns `410`
+> for both `/profileView` and `/networkinfo`, so the chain was reordered around
+> what actually works.
+
+The chain distinguishes **three** failure modes, and the distinction is
+load-bearing:
 
 - **Blocked** (`999`/`429`/`403`/`401`) → abort the chain immediately. Trying the next strategy on an identity LinkedIn just flagged only deepens the block.
-- **Endpoint retired** (`410`) → fall through at once. The identity is healthy; this route simply no longer exists, and it must not be counted against the identity's health.
+- **Endpoint retired** (`410`) → fall through at once. The identity is healthy; this route no longer exists, and it must not count against the identity's health.
 - **Parse failure** → fall through to the next strategy.
 
-Collapsing the first two is a real bug, and it was one this codebase had: before live testing, `410` fell into the generic `>= 300` branch and was reported as `AUTH_FAILED`, which aborted the chain and would have made a retired endpoint look like an expired cookie.
+Collapsing the first two is a real bug, and it was one this codebase had: before
+live testing, `410` fell into the generic `>= 300` branch and was reported as
+`AUTH_FAILED`, which aborted the chain and made a retired endpoint look exactly
+like an expired cookie.
 
-Every `queryId` is overridable by environment variable (`QID_PROFILE_CARDS`, …), so a rotation is a config change rather than a redeploy.
+#### Cookie scoping, and a bug it caused
 
-#### The browser fallback doesn't scrape the DOM either
+LinkedIn splits its cookies across two domains, and getting this wrong produces
+an error that points nowhere near the cause. Straight off the wire, from the
+`Set-Cookie` headers LinkedIn sends when invalidating a session:
 
-LinkedIn server-renders its Voyager responses into the page as inline `<code id="bpr-guid-…">` blobs, which the SPA hydrates from. So Chromium is used purely to *obtain* those payloads — with a real browser fingerprint — and then **the exact same parsers run over them**.
+```
+li_at=delete me;   Domain=.www.linkedin.com
+li_a="delete me";  Domain=.www.linkedin.com
+liap=delete me;    Domain=.linkedin.com
+```
 
-That matters for maintenance: there is one parsing implementation, not two. A LinkedIn schema change can't leave the fallback silently producing different results from the primary path.
+Seeding every cookie on `.linkedin.com` — the obvious guess — means the browser
+never sends `li_at` to `www.linkedin.com`. LinkedIn treats the navigation as
+unauthenticated and answers with its "clear your cookies and retry" 302, which
+the browser follows forever: `ERR_TOO_MANY_REDIRECTS`. Nothing about that error
+suggests a cookie-scope bug. The API now scopes cookies per LinkedIn's own
+domains and reports the redirect loop as an actionable `AUTH_FAILED`.
+
+#### Header fidelity
+
+`x-li-track` is built per identity from that identity's own cookies rather than
+being a fixed constant, because LinkedIn cross-checks it. Sending
+`timezone: UTC` while the account's `timezone` cookie says `Asia/Calcutta` is an
+inconsistency a real browser never produces.
 
 ### 4. Cache-first read path
 
@@ -421,11 +475,23 @@ Deployed to **Google Cloud Run** (asia-south1). One command, idempotent:
 
 It enables the required APIs, creates the Artifact Registry repo, the cache bucket and a least-privilege service account, builds the container with Cloud Build, and deploys.
 
-Create the secret first (this is the one step the script won't do for you, because it's the one that touches credentials):
+Establish the session locally first, then upload it — this is the one step the
+script won't do for you, because it's the one that touches credentials:
 
 ```bash
-printf '%s' '[{"label":"primary","liAt":"AQEDA...","jsessionId":"ajax:1234567890123456789"}]' \
-  | gcloud secrets create linkedin-identities --data-file=-
+npm run login
+gcloud storage cp .sessions/primary.json gs://<bucket>/sessions/primary.json
+```
+
+On Cloud Run the session lives in the same bucket as the profile cache, because
+the container filesystem is ephemeral: without that, every cold start would
+replay a stale seed and re-trigger LinkedIn's replay detection.
+
+An identity still needs to exist for the pool to hand out. With credentials-only
+setup that is just a label:
+
+```bash
+printf '%s' 'primary' | gcloud secrets create identity-label --data-file=-
 ```
 
 Optional secrets — attached automatically when present: `proxy-urls`, `proxy-sticky-template`, `api-keys`.
@@ -458,6 +524,8 @@ Symptom: strategy 1 works, strategy 2 returns empty. Fix without redeploying cod
 **Fundamental to the approach**
 
 - **This violates LinkedIn's Terms of Service.** The account whose cookie is used can be restricted or permanently banned. See [Legal](#legal).
+- **Sessions need occasional manual re-establishment.** Persistence follows token rotation, but a password change, an explicit logout elsewhere, or a security challenge still ends the session. That surfaces as `AUTH_FAILED` (502) and needs `npm run login` again. There is no automated re-login inside the server, deliberately: automating LinkedIn login is the most reliable way to trigger a CAPTCHA and lock the account, so it stays a supervised, human-present step.
+- **Only one process may use a session at a time.** Two containers sharing stored state would rotate the token out from under each other — the same stale-replay problem, self-inflicted. Reinforces `--max-instances=1`.
 - **Session cookies expire, and can be killed early.** `li_at` nominally lasts ~12 months, but is invalidated by a password change, an explicit logout, a security challenge — or by LinkedIn deciding the cookie is being replayed (see [Why the whole jar matters](#why-the-whole-jar-matters)). Both surface as `AUTH_FAILED` (502) and need a manual cookie refresh. There is no automated re-login, deliberately: automating LinkedIn login is the single most reliable way to trigger a CAPTCHA challenge and lock the account.
 - **LinkedIn retires endpoints without notice.** `/profileView` and `/networkinfo` returned complete data for years and now return `410 Gone`. Nothing about this approach is stable by construction; the strategy chain limits the blast radius of any one retirement, it doesn't prevent them.
 - **`queryId` hashes rotate** with LinkedIn web builds and will eventually break strategy 2. Mitigated by ordering the queryId-free endpoint first and by env-var overrides, not eliminated.
@@ -505,12 +573,17 @@ src/
 ├── errors.ts                   error taxonomy → HTTP status mapping
 ├── openapi.ts                  OpenAPI doc generated from the Zod schemas
 ├── schema/profile.ts           the public response contract
+├── browser/
+│   ├── session.ts              warmed authenticated Chromium; in-page Voyager calls
+│   ├── session-store.ts        storage-state persistence (file + GCS)
+│   ├── login.ts                interactive login helper
+│   └── login-cli.ts            `npm run login`
 ├── linkedin/
 │   ├── url.ts                  profile URL → publicId
-│   ├── voyager-client.ts       authenticated Voyager transport
+│   ├── voyager-client.ts       raw-HTTP Voyager transport
 │   ├── endpoints.ts            endpoint catalogue + queryId overrides
 │   ├── normalize.ts            normalized-graph rehydration
-│   ├── scraper.ts              the strategy chain
+│   ├── scraper.ts              transports + the strategy chain
 │   └── parse/
 │       ├── common.ts           dates, images, union unwrapping
 │       ├── profile-view.ts     legacy REST parser
@@ -518,9 +591,9 @@ src/
 ├── identity/
 │   ├── pool.ts                 identity rotation + health
 │   └── proxy.ts                provider-agnostic proxy plumbing
-├── cache/{gcs,memory}.ts       blob cache + local fallback
+├── cache/{gcs,memory}.ts       profile blob cache + local fallback
 ├── ratelimit/scrape-limiter.ts sliding-window scrape ceiling
-├── fallback/browser.ts         Playwright fallback
 ├── service/profile-service.ts  cache-first read path, single-flight
 └── routes/                     HTTP layer
 ```
+
