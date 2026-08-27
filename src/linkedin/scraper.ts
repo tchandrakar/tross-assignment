@@ -5,8 +5,9 @@ import type { Profile, ScrapeSource } from '../schema/profile.js';
 import { profileSchema } from '../schema/profile.js';
 import { VoyagerClient } from './voyager-client.js';
 import { normalize } from './normalize.js';
+import type { BrowserSession } from '../browser/session.js';
 import {
-  dashProfileByVanityPath, profileCardsPath, profileNetworkInfoPath, profileViewPath,
+  dashProfileByVanityPath, profileCardsPath, profileNetworkInfoPath, profileViewPath, publicProfileUrl,
 } from './endpoints.js';
 import { parseProfileView } from './parse/profile-view.js';
 import {
@@ -14,12 +15,44 @@ import {
   entityToHonor, entityToLanguage, entityToProject, entityToPublication, entityToSkill,
   entityToVolunteer, type CardEntity,
 } from './parse/dash-cards.js';
-import { attributedText, get, isObject, num, parseCountText, parseVectorImage, pick, str } from './parse/common.js';
+import { attributedText, get, isObject, num, parseVectorImage, pick, str } from './parse/common.js';
 
 export interface ScrapeResult {
   profile: Profile;
   source: ScrapeSource;
   missingSections: string[];
+}
+
+/**
+ * How a Voyager request gets made. The two implementations differ only in
+ * transport — raw HTTP versus a fetch issued from inside a real authenticated
+ * Chromium page — so every parser and every extraction routine is shared.
+ */
+export interface Transport {
+  readonly source: ScrapeSource;
+  /**
+   * `publicId` is the profile being scraped. The browser transport uses it to
+   * land on that profile's page before issuing in-page calls, so one navigation
+   * both establishes the session and puts us on a same-origin, on-topic page.
+   */
+  fetch(path: string, identity: Identity, publicId: string): Promise<unknown>;
+}
+
+export class HttpTransport implements Transport {
+  readonly source = 'voyager-graphql' as const;
+  constructor(private readonly client: VoyagerClient) {}
+  async fetch(path: string, identity: Identity): Promise<unknown> {
+    return (await this.client.get({ path, identity })).body;
+  }
+
+}
+
+export class BrowserTransport implements Transport {
+  readonly source = 'browser-voyager' as const;
+  constructor(private readonly session: BrowserSession) {}
+  async fetch(path: string, identity: Identity, publicId: string): Promise<unknown> {
+    return (await this.session.fetchVoyager(identity, path, publicProfileUrl(publicId))).body;
+  }
 }
 
 interface Strategy {
@@ -28,36 +61,58 @@ interface Strategy {
 }
 
 /**
- * Runs the extraction strategies in order of decreasing reliability and stops
- * at the first one that returns a profile with a name on it.
+ * Runs extraction strategies in order and stops at the first that returns a
+ * profile with a name on it.
  *
- *   1. profileView   — legacy REST, one call, complete, no rotating queryId
- *   2. dash GraphQL  — what the current web client uses; survives when (1) is off
- *   3. browser       — headless Playwright against the rendered page (opt-in)
+ *   1. browser-voyager      — Voyager API called from inside a real browser page.
+ *                             Same JSON, same parsers; the transport carries
+ *                             Chrome's true TLS fingerprint and cookie jar.
+ *   2. voyager-graphql      — the same dash calls over raw HTTP. Faster and much
+ *                             cheaper, but far easier for LinkedIn to fingerprint.
+ *   3. voyager-profile-view — legacy REST. 410 Gone as of 2026-08; kept because
+ *                             it costs one call and is the richest single response
+ *                             wherever it still works.
+ *   4. browser              — harvest payloads from the rendered profile page.
  *
- * A strategy that gets *blocked* aborts the chain — trying the next strategy on
- * an identity LinkedIn just flagged only deepens the block. A strategy that
- * merely fails to parse falls through to the next one.
+ * Failure handling distinguishes three cases, and the distinction is
+ * load-bearing:
+ *   - blocked (999/429/403/401) → abort the chain. Trying another strategy on an
+ *     identity LinkedIn just flagged only deepens the block.
+ *   - endpoint retired (410)    → fall through at once; the identity is healthy.
+ *   - parse failure             → fall through to the next strategy.
  */
 export class ProfileScraper {
   private readonly client: VoyagerClient;
+  private readonly httpTransport: HttpTransport;
+  private readonly browserTransport: BrowserTransport | null;
 
   constructor(
     private readonly pool: IdentityPool,
     private readonly logger: FastifyBaseLogger,
-    private readonly browserFallback: ((publicId: string) => Promise<ScrapeResult>) | null,
+    private readonly browser: BrowserSession | null,
+    private readonly enableHttpTransport = false,
   ) {
     this.client = new VoyagerClient(pool);
+    this.httpTransport = new HttpTransport(this.client);
+    this.browserTransport = browser ? new BrowserTransport(browser) : null;
   }
 
   async scrape(publicId: string): Promise<ScrapeResult> {
-    const strategies: Strategy[] = [
-      { name: 'voyager-profile-view', run: (id) => this.viaProfileView(id) },
-      { name: 'voyager-graphql', run: (id) => this.viaDashCards(id) },
-    ];
+    const strategies: Strategy[] = [];
 
-    if (this.browserFallback) {
-      strategies.push({ name: 'browser', run: (id) => this.browserFallback!(id) });
+    if (this.browserTransport) {
+      strategies.push({ name: 'browser-voyager', run: (id) => this.viaDash(id, this.browserTransport!) });
+    }
+    // Raw HTTP is opt-in: it makes the same calls, but LinkedIn fingerprints
+    // the client and answers by killing the session. See config.ENABLE_HTTP_TRANSPORT.
+    if (this.enableHttpTransport) {
+      strategies.push(
+        { name: 'voyager-graphql', run: (id) => this.viaDash(id, this.httpTransport) },
+        { name: 'voyager-profile-view', run: (id) => this.viaProfileView(id) },
+      );
+    }
+    if (this.browser) {
+      strategies.push({ name: 'browser', run: (id) => this.viaRenderedPage(id) });
     }
 
     const failures: string[] = [];
@@ -74,12 +129,19 @@ export class ProfileScraper {
         return result;
       } catch (error) {
         if (error instanceof ApiError) {
-          // Terminal outcomes — no later strategy can do better.
           if (error.code === 'PROFILE_NOT_FOUND' || error.code === 'NO_IDENTITY_AVAILABLE') throw error;
+
+          if (error.code === 'ENDPOINT_RETIRED') {
+            this.logger.debug({ strategy: strategy.name }, 'endpoint retired by LinkedIn, falling through');
+            failures.push(`${strategy.name}: retired (410)`);
+            continue;
+          }
+
           if (error.code === 'UPSTREAM_BLOCKED' || error.code === 'AUTH_FAILED') {
             this.logger.warn({ strategy: strategy.name, code: error.code }, 'blocked upstream, aborting strategy chain');
             throw error;
           }
+
           failures.push(`${strategy.name}: ${error.code}`);
         } else {
           failures.push(`${strategy.name}: ${(error as Error).message}`);
@@ -93,24 +155,110 @@ export class ProfileScraper {
     });
   }
 
-  // ─── Strategy 1: legacy profileView ────────────────────────────────────────
+  // ─── Dash profile + cards, over either transport ───────────────────────────
+
+  private async viaDash(publicId: string, transport: Transport): Promise<ScrapeResult> {
+    return this.client.withIdentity(async (identity) => {
+      const body = await transport
+        .fetch(dashProfileByVanityPath(publicId), identity, publicId)
+        .catch(async (error: unknown) => {
+          // A dead session's persisted state must be discarded, or every retry
+          // replays the same dead token.
+          if (error instanceof ApiError && error.code === 'AUTH_FAILED') {
+            await this.browser?.invalidate(identity);
+          }
+          throw error;
+        });
+      const { data: dashData, included } = normalize(body);
+
+      const record =
+        (pick(dashData, 'elements.0') as unknown) ??
+        included.find((e) => typeof e.$type === 'string' && (e.$type as string).endsWith('identity.profile.Profile'));
+
+      if (!isObject(record)) {
+        throw new ApiError('PROFILE_NOT_FOUND', 'LinkedIn returned no profile record for that identifier.');
+      }
+
+      const base = this.parseTopCard(record, publicId);
+      const sections = await this.fetchCards(publicId, identity, transport);
+
+      return {
+        source: transport.source,
+        missingSections: sections.missing,
+        profile: profileSchema.parse({ ...base, ...sections.parsed }),
+      };
+    });
+  }
+
+  private parseTopCard(record: Record<string, unknown>, publicId: string) {
+    const firstName = str(pick(record, 'firstName'));
+    const lastName = str(pick(record, 'lastName'));
+    const headline = str(pick(record, 'headline'));
+
+    return {
+      publicId,
+      profileUrl: publicProfileUrl(publicId),
+      urn: str(pick(record, 'entityUrn', 'dashEntityUrn')),
+      firstName,
+      lastName,
+      fullName: [firstName, lastName].filter(Boolean).join(' ') || null,
+      headline,
+      about: attributedText(pick(record, 'summary')) ?? str(pick(record, 'summary')),
+      location: {
+        full: str(pick(record, 'geoLocation.geo.defaultLocalizedName', 'geoLocationName', 'locationName')),
+        city: str(pick(record, 'geoLocation.geo.defaultLocalizedName'))?.split(',')[0]?.trim() ?? null,
+        country: str(pick(record, 'geoCountry.defaultLocalizedName', 'geoCountryName')),
+        countryCode: str(pick(record, 'location.countryCode'))?.toUpperCase()?.slice(0, 2) ?? null,
+      },
+      industry: str(pick(record, 'industry.name', 'industryName')),
+      pronouns: str(pick(record, 'standardizedPronoun', 'customPronoun')),
+      connectionCount: num(pick(record, 'connections.paging.total', 'connectionsCount')),
+      followerCount: num(pick(record, 'followingState.followerCount', 'followerCount')),
+      isPremium: pick(record, 'premium') === true,
+      isInfluencer: pick(record, 'influencer') === true,
+      isOpenToWork: get(record, 'profileOpenToWorkCard') != null || /open to work/i.test(headline ?? ''),
+      isHiring: /hiring/i.test(headline ?? ''),
+      profilePicture: parseVectorImage(pick(record, 'profilePicture.displayImageReference.vectorImage', 'profilePicture')),
+      backgroundImage: parseVectorImage(
+        pick(record, 'backgroundImage.displayImageReference.vectorImage', 'backgroundPicture', 'backgroundImage'),
+      ),
+    };
+  }
+
+  private async fetchCards(publicId: string, identity: Identity, transport: Transport) {
+    const empty = {
+      experience: [], education: [], skills: [], certifications: [],
+      languages: [], projects: [], publications: [], honors: [], volunteering: [],
+    };
+
+    let cards: unknown;
+    try {
+      cards = normalize(await transport.fetch(profileCardsPath(publicId), identity, publicId)).data;
+    } catch (error) {
+      if (error instanceof ApiError && (error.code === 'UPSTREAM_BLOCKED' || error.code === 'AUTH_FAILED')) throw error;
+      this.logger.warn({ err: error, publicId }, 'profile cards fetch failed; returning top-card data only');
+      return { parsed: empty, missing: Object.keys(empty) };
+    }
+
+    return parseCards(cards);
+  }
+
+  // ─── Legacy profileView ────────────────────────────────────────────────────
 
   private async viaProfileView(publicId: string): Promise<ScrapeResult> {
     return this.client.withIdentity(async (identity) => {
       const response = await this.client.get({ path: profileViewPath(publicId), identity });
       const { data } = normalize(response.body);
-
       const { profile, missingSections } = parseProfileView(data);
 
-      // profileView omits network counts, so top them up with a cheap second
-      // call. A failure here must not fail the whole scrape.
+      // profileView omits network counts. Failure here must not fail the scrape.
+      // (This endpoint is also 410 as of 2026-08 — counts come from dash instead.)
       let connectionCount: number | null = null;
       let followerCount: number | null = null;
       try {
-        const network = await this.client.get({ path: profileNetworkInfoPath(publicId), identity });
-        const networkData = normalize(network.body).data;
-        connectionCount = num(pick(networkData, 'connectionsCount', 'connections.paging.total'));
-        followerCount = num(pick(networkData, 'followersCount', 'followerCount'));
+        const network = normalize((await this.client.get({ path: profileNetworkInfoPath(publicId), identity })).body).data;
+        connectionCount = num(pick(network, 'connectionsCount', 'connections.paging.total'));
+        followerCount = num(pick(network, 'followersCount', 'followerCount'));
       } catch (error) {
         this.logger.debug({ err: error, publicId }, 'networkinfo lookup failed; counts will be null');
       }
@@ -121,7 +269,7 @@ export class ProfileScraper {
         profile: profileSchema.parse({
           ...profile,
           publicId,
-          profileUrl: `https://www.linkedin.com/in/${publicId}/`,
+          profileUrl: publicProfileUrl(publicId),
           connectionCount,
           followerCount,
         }),
@@ -129,111 +277,22 @@ export class ProfileScraper {
     });
   }
 
-  // ─── Strategy 2: dash profile + GraphQL cards ──────────────────────────────
+  // ─── Rendered page harvest ─────────────────────────────────────────────────
 
-  private async viaDashCards(publicId: string): Promise<ScrapeResult> {
+  private async viaRenderedPage(publicId: string): Promise<ScrapeResult> {
+    if (!this.browser) throw new ApiError('PARSE_FAILED', 'Browser fallback is disabled.');
+
     return this.client.withIdentity(async (identity) => {
-      const dashResponse = await this.client.get({ path: dashProfileByVanityPath(publicId), identity });
-      const { data: dashData, included } = normalize(dashResponse.body);
-
-      const record =
-        (pick(dashData, 'elements.0') as unknown) ??
-        included.find((e) => typeof e.$type === 'string' && (e.$type as string).endsWith('identity.profile.Profile'));
-
-      if (!isObject(record)) {
-        throw new ApiError('PROFILE_NOT_FOUND', 'LinkedIn returned no profile record for that identifier.');
-      }
-
-      const urn = str(pick(record, 'entityUrn', 'dashEntityUrn'));
-      const firstName = str(pick(record, 'firstName'));
-      const lastName = str(pick(record, 'lastName'));
-
-      const base = {
-        publicId,
-        profileUrl: `https://www.linkedin.com/in/${publicId}/`,
-        urn,
-        firstName,
-        lastName,
-        fullName: [firstName, lastName].filter(Boolean).join(' ') || null,
-        headline: str(pick(record, 'headline')),
-        about: attributedText(pick(record, 'summary')) ?? str(pick(record, 'summary')),
-        location: {
-          full: str(pick(record, 'geoLocation.geo.defaultLocalizedName', 'geoLocationName', 'locationName')),
-          city: str(pick(record, 'geoLocation.geo.defaultLocalizedName'))?.split(',')[0]?.trim() ?? null,
-          country: str(pick(record, 'geoCountry.defaultLocalizedName', 'geoCountryName')),
-          countryCode: str(pick(record, 'location.countryCode'))?.toUpperCase()?.slice(0, 2) ?? null,
-        },
-        industry: str(pick(record, 'industry.name', 'industryName')),
-        pronouns: str(pick(record, 'standardizedPronoun', 'customPronoun')),
-        connectionCount: num(pick(record, 'connections.paging.total', 'connectionsCount')),
-        followerCount: num(pick(record, 'followingState.followerCount', 'followerCount')),
-        isPremium: pick(record, 'premium') === true,
-        isInfluencer: pick(record, 'influencer') === true,
-        isOpenToWork: get(record, 'profileOpenToWorkCard') != null || /open to work/i.test(str(pick(record, 'headline')) ?? ''),
-        isHiring: /hiring/i.test(str(pick(record, 'headline')) ?? ''),
-        profilePicture: parseVectorImage(pick(record, 'profilePicture.displayImageReference.vectorImage', 'profilePicture')),
-        backgroundImage: parseVectorImage(
-          pick(record, 'backgroundImage.displayImageReference.vectorImage', 'backgroundPicture', 'backgroundImage'),
-        ),
-      };
-
-      const sections = await this.fetchCards(publicId, identity);
-
-      return {
-        source: 'voyager-graphql' as const,
-        missingSections: sections.missing,
-        profile: profileSchema.parse({ ...base, ...sections.parsed }),
-      };
+      const payloads = await this.browser!.collectRenderedPayloads(identity, publicId);
+      return selectBestPayload(payloads, publicId, this.logger);
     });
-  }
-
-  private async fetchCards(publicId: string, identity: Identity) {
-    const missing: string[] = [];
-    const empty = {
-      experience: [], education: [], skills: [], certifications: [],
-      languages: [], projects: [], publications: [], honors: [], volunteering: [],
-    };
-
-    let cards: unknown;
-    try {
-      const response = await this.client.get({ path: profileCardsPath(publicId), identity });
-      cards = normalize(response.body).data;
-    } catch (error) {
-      if (error instanceof ApiError && (error.code === 'UPSTREAM_BLOCKED' || error.code === 'AUTH_FAILED')) throw error;
-      this.logger.warn({ err: error, publicId }, 'profile cards fetch failed; returning top-card data only');
-      return { parsed: empty, missing: Object.keys(empty) };
-    }
-
-    const grouped = groupCardsBySection(cards);
-
-    const take = <T>(key: string, mapper: (e: CardEntity) => T): T[] => {
-      const entities = grouped.get(key) ?? [];
-      if (entities.length === 0) missing.push(key);
-      return entities.map(mapper);
-    };
-
-    if ((grouped.get('experience') ?? []).length === 0) missing.push('experience');
-
-    return {
-      missing,
-      parsed: {
-        experience: (grouped.get('experience') ?? []).flatMap(flattenRoles),
-        education: take('education', entityToEducation),
-        skills: take('skills', entityToSkill).filter((s) => s.name.length > 0),
-        certifications: take('certifications', entityToCertification),
-        languages: take('languages', entityToLanguage).filter((l) => l.name.length > 0),
-        projects: take('projects', entityToProject),
-        publications: take('publications', entityToPublication),
-        honors: take('honors', entityToHonor),
-        volunteering: take('volunteering', entityToVolunteer),
-      },
-    };
   }
 }
 
+// ─── Card grouping ───────────────────────────────────────────────────────────
+
 /**
- * Cards identify their section through a `*card`/`topComponents` urn that
- * contains the section name, e.g.
+ * Cards identify their section through an urn that names it, e.g.
  *   urn:li:fsd_profileCard:(ACoAAB…,EXPERIENCE,en_US)
  */
 const SECTION_ALIASES: Record<string, string> = {
@@ -249,7 +308,7 @@ const SECTION_ALIASES: Record<string, string> = {
   VOLUNTEERING_EXPERIENCE: 'volunteering',
 };
 
-function groupCardsBySection(cards: unknown): Map<string, CardEntity[]> {
+export function groupCardsBySection(cards: unknown): Map<string, CardEntity[]> {
   const grouped = new Map<string, CardEntity[]>();
   const elements = Array.isArray(get(cards, 'elements')) ? (get(cards, 'elements') as unknown[]) : [];
 
@@ -266,14 +325,42 @@ function groupCardsBySection(cards: unknown): Map<string, CardEntity[]> {
   return grouped;
 }
 
+export function parseCards(cards: unknown) {
+  const grouped = groupCardsBySection(cards);
+  const missing: string[] = [];
+
+  const take = <T>(key: string, mapper: (e: CardEntity) => T): T[] => {
+    const entities = grouped.get(key) ?? [];
+    if (entities.length === 0) missing.push(key);
+    return entities.map(mapper);
+  };
+
+  const experienceEntities = grouped.get('experience') ?? [];
+  if (experienceEntities.length === 0) missing.push('experience');
+
+  return {
+    missing,
+    parsed: {
+      experience: experienceEntities.flatMap(flattenRoles),
+      education: take('education', entityToEducation),
+      skills: take('skills', entityToSkill).filter((s) => s.name.length > 0),
+      certifications: take('certifications', entityToCertification),
+      languages: take('languages', entityToLanguage).filter((l) => l.name.length > 0),
+      projects: take('projects', entityToProject),
+      publications: take('publications', entityToPublication),
+      honors: take('honors', entityToHonor),
+      volunteering: take('volunteering', entityToVolunteer),
+    },
+  };
+}
+
 /**
  * LinkedIn groups several roles at the same employer under one company entity:
- * the outer entity carries the company (and its combined tenure), each child
- * carries a job title. Flatten those into standalone experience records so a
- * caller never has to know about the nesting — the child's title wins, the
- * parent's company is inherited.
+ * the outer entity carries the company (and combined tenure), each child a job
+ * title. Flatten those into standalone records so a caller never has to know
+ * about the nesting — the child's title wins, the parent's company is inherited.
  */
-function flattenRoles(entity: CardEntity): ReturnType<typeof entityToExperience>[] {
+export function flattenRoles(entity: CardEntity): ReturnType<typeof entityToExperience>[] {
   if (entity.children.length === 0) return [entityToExperience(entity)];
 
   const parent = entityToExperience(entity);
@@ -293,4 +380,51 @@ function flattenRoles(entity: CardEntity): ReturnType<typeof entityToExperience>
   });
 }
 
-export { parseCountText };
+// ─── Rendered-payload selection ──────────────────────────────────────────────
+
+/**
+ * Payloads harvested from a rendered page arrive in arbitrary order and most
+ * are unrelated (nav, ads, messaging), so score rather than assume.
+ */
+export function selectBestPayload(payloads: unknown[], publicId: string, logger: FastifyBaseLogger): ScrapeResult {
+  let best: { score: number; result: ScrapeResult } | null = null;
+
+  for (const payload of payloads) {
+    let data: unknown;
+    try {
+      data = normalize(payload).data;
+    } catch {
+      continue;
+    }
+
+    const candidate = looksLikeProfileView(data) ? data : looksLikeProfileView(payload) ? payload : null;
+    if (!candidate) continue;
+
+    try {
+      const { profile, missingSections } = parseProfileView(candidate);
+      const parsed = profileSchema.parse({ ...profile, publicId, profileUrl: publicProfileUrl(publicId) });
+
+      const score =
+        (parsed.fullName ? 4 : 0) + parsed.experience.length + parsed.education.length + parsed.skills.length;
+
+      if (!best || score > best.score) {
+        best = { score, result: { profile: parsed, source: 'browser', missingSections } };
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  if (!best || best.score === 0) {
+    throw new ApiError('PARSE_FAILED', 'The rendered page contained no recognisable profile payload.', {
+      details: { publicId, payloadsInspected: payloads.length },
+    });
+  }
+
+  logger.debug({ publicId, score: best.score }, 'selected best rendered payload');
+  return best.result;
+}
+
+function looksLikeProfileView(data: unknown): boolean {
+  return isObject(data) && ('positionView' in data || 'educationView' in data || 'profile' in data);
+}

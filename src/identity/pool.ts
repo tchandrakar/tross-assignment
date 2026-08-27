@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import type { Dispatcher } from 'undici';
 import type { AppConfig, IdentityConfig } from '../config.js';
 import { ApiError } from '../errors.js';
@@ -25,12 +25,20 @@ const QUARANTINE_AFTER_FAILURES = 5;
 export type IdentityState = 'available' | 'cooling-down' | 'quarantined';
 
 export interface Identity {
+  /**
+   * Stable across restarts — derived from the label, not random. Persisted
+   * browser session state is keyed on this, so a per-process id would orphan
+   * the stored session on every deploy and silently reintroduce stale-token
+   * replay (see browser/session-store.ts).
+   */
   readonly id: string;
   readonly label: string;
   readonly liAt: string;
   readonly jsessionId: string;
   /** CSRF token LinkedIn expects — literally the JSESSIONID with quotes stripped. */
   readonly csrfToken: string;
+  /** Supporting cookies sent alongside li_at/JSESSIONID. */
+  readonly cookies: Record<string, string>;
   readonly proxyUrl: string | undefined;
   readonly dispatcher: Dispatcher;
   /** Stable per-identity session id handed to sticky-session proxy providers. */
@@ -173,12 +181,15 @@ function buildIdentity(cfg: IdentityConfig, index: number, config: AppConfig): I
 
   const proxyUrl = resolveProxyUrl(cfg, index, config, stickySessionId);
 
+  const label = cfg.label || `identity-${index + 1}`;
+
   return {
-    id: randomUUID(),
-    label: cfg.label || `identity-${index + 1}`,
+    id: label.replace(/[^a-zA-Z0-9._-]/g, '_'),
+    label,
     liAt: cfg.liAt,
     jsessionId: cfg.jsessionId,
     csrfToken: cfg.jsessionId.replaceAll('"', ''),
+    cookies: cfg.cookies ?? {},
     proxyUrl,
     dispatcher: getDispatcher(proxyUrl),
     stickySessionId,

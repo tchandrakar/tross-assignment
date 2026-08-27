@@ -13,7 +13,9 @@ import { IdentityPool } from './identity/pool.js';
 import { ProfileScraper } from './linkedin/scraper.js';
 import { ScrapeLimiter } from './ratelimit/scrape-limiter.js';
 import { ProfileService } from './service/profile-service.js';
-import { BrowserFallback } from './fallback/browser.js';
+import { BrowserSession } from './browser/session.js';
+import { FileSessionStore, GcsSessionStore, type SessionStore } from './browser/session-store.js';
+import { Storage } from '@google-cloud/storage';
 import { registerProfileRoutes } from './routes/profile.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { buildOpenApiDocument } from './openapi.js';
@@ -57,12 +59,14 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
   const cache = createCache(config);
   const limiter = new ScrapeLimiter(config.scrapeRatePerMinute);
 
-  const browserFallback = config.enableBrowserFallback ? new BrowserFallback(pool, app.log) : null;
-  const scraper = new ProfileScraper(
-    pool,
-    app.log,
-    browserFallback ? (publicId) => browserFallback.scrape(publicId) : null,
-  );
+  // Persisted browser state is what lets us follow LinkedIn's li_at rotation
+  // instead of replaying a stale token — see browser/session-store.ts.
+  const sessionStore: SessionStore = config.gcsBucket
+    ? new GcsSessionStore(new Storage(), config.gcsBucket)
+    : new FileSessionStore(config.sessionStateDir);
+
+  const browserSession = config.enableBrowserFallback ? new BrowserSession(app.log, sessionStore) : null;
+  const scraper = new ProfileScraper(pool, app.log, browserSession, config.enableHttpTransport);
   const service = new ProfileService(scraper, cache, limiter, config, app.log);
 
   registerApiKeyAuth(app, config);
@@ -77,6 +81,13 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
   registerHealthRoutes(app, { pool, cache, limiter, startedAt });
   registerProfileRoutes(app, service);
 
+  if (!browserSession && !config.enableHttpTransport) {
+    throw new Error(
+      'No extraction transport is enabled: ENABLE_BROWSER_FALLBACK and ENABLE_HTTP_TRANSPORT are both false. ' +
+        'Enable at least one, or the service can never fetch a profile.',
+    );
+  }
+
   if (pool.size === 0) {
     app.log.warn(
       'No LinkedIn identity configured — every scrape will fail with NO_IDENTITY_AVAILABLE. ' +
@@ -88,7 +99,7 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
     app,
     config,
     shutdown: async () => {
-      await browserFallback?.close();
+      await browserSession?.close();
       await app.close();
     },
   };

@@ -52,21 +52,34 @@ npm run build     # compile to dist/
 
 ### Getting the session cookies
 
-The API authenticates as a logged-in LinkedIn member. Two cookies are needed:
+The API authenticates as a logged-in LinkedIn member.
+
+**Copy the whole `cookie:` header — not just `li_at`.** This is the single most important setup step, and getting it wrong causes a failure that looks like something else entirely (see below).
 
 1. Log in to `linkedin.com` in a browser.
-2. Open DevTools → **Application** → **Cookies** → `https://www.linkedin.com`.
-3. Copy two values:
-
-| Cookie | Looks like | Used as |
-|---|---|---|
-| `li_at` | `AQEDAS8...` (long opaque string) | The session itself |
-| `JSESSIONID` | `"ajax:1234567890123456789"` | The CSRF token — **strip the surrounding quotes** |
+2. DevTools → **Network** tab → click any request to `www.linkedin.com`.
+3. Under **Request Headers**, copy the entire value of `cookie:`.
+4. Paste it into `LI_COOKIES`:
 
 ```bash
-LI_AT=AQEDAS8...
-LI_JSESSIONID=ajax:1234567890123456789
+LI_COOKIES='bcookie="v=2&abc..."; bscookie="v=1&..."; li_at=AQEDAS8...; JSESSIONID="ajax:1234567890123456789"; lidc="b=OB1:..."; li_gc=MTs...'
 ```
+
+`li_at` and `JSESSIONID` are extracted from that string automatically. You can still set them individually via `LI_AT` / `LI_JSESSIONID`, but the session will be considerably shorter-lived.
+
+#### Why the whole jar matters
+
+**LinkedIn validates the *set* of cookies, not just the session cookie.** A bare `li_at` arriving without the browser-identity cookies that normally accompany it (`bcookie`, `bscookie`, `lidc`, `li_gc`) looks exactly like a cookie that has been lifted from a browser and replayed elsewhere — which is what it is.
+
+Observed directly while building this: with only `li_at` + `JSESSIONID`, four requests succeeded and the fifth came back as
+
+```http
+HTTP/2 302
+location: https://www.linkedin.com/voyager/api/me
+set-cookie: li_at=delete me; Expires=Thu, 01-Jan-1970 00:00:00 GMT; Max-Age=0
+```
+
+That is not a rate limit and not an expiry — LinkedIn **invalidated the session server-side** and the cookie is unrecoverable. The API detects this specific response and reports it as a distinct `AUTH_FAILED` with `sessionInvalidated: true`, because the remedy is different from an ordinary auth-wall bounce: you need a fresh login, and retrying only burns the account further.
 
 `li_at` is a bearer credential for the entire account. Treat it exactly like a password: it is never committed, never logged (the logger redacts `cookie` headers), and in production it lives in Secret Manager rather than in the service config.
 
@@ -79,6 +92,7 @@ Every option is in [`.env.example`](.env.example). The ones that matter:
 | Variable | Default | Purpose |
 |---|---|---|
 | `LINKEDIN_IDENTITIES` | — | JSON array of `{label, liAt, jsessionId, proxy?}`. The multi-account form. |
+| `LI_COOKIES` | — | A whole pasted `cookie:` header. `li_at` and `JSESSIONID` are extracted from it. **Preferred.** |
 | `LI_AT` / `LI_JSESSIONID` | — | Single-account shorthand, used only when `LINKEDIN_IDENTITIES` is empty. |
 | `PROXY_URLS` | — | Comma-separated proxy URLs, assigned round-robin to identities. |
 | `PROXY_STICKY_TEMPLATE` | — | Proxy URL template with `{session}` for sticky-session providers. |
@@ -291,16 +305,21 @@ LinkedIn's GraphQL endpoints are addressed by `queryId` — an opaque hash of a 
 
 So extraction runs three strategies, most-reliable first:
 
-| # | Strategy | Endpoint | Why this order |
+| # | Strategy | Endpoint | Notes |
 |---|---|---|---|
-| 1 | `voyager-profile-view` | `/identity/profiles/{id}/profileView` | Legacy REST. One call returns *every* section. **Takes no queryId**, so there's no hash to rotate. Predates the GraphQL migration and has never been removed. |
-| 2 | `voyager-graphql` | `/identity/dash/profiles` + `/graphql` profile cards | What the current web client actually uses. Survives when (1) is disabled for an account. Returns *rendering instructions* rather than data, so it needs more interpretation. |
+| 1 | `voyager-graphql` | `/identity/dash/profiles` + `/graphql` profile cards | What the current web client uses. **Verified working against live LinkedIn.** Returns *rendering instructions* rather than data, so it needs more interpretation. |
+| 2 | `voyager-profile-view` | `/identity/profiles/{id}/profileView` | Legacy REST — one call returned *every* section, and took no `queryId`. **Returns `410 Gone` as of 2026-08** (see below). Kept because it's cheap to try, the retirement may be staged per-account, and it's by far the richest single response where it still works. |
 | 3 | `browser` | Headless Chromium on the public profile page | Real TLS fingerprint and JS execution. Slow and memory-hungry, so it's last. |
 
-The chain distinguishes two failure modes, which matters more than it sounds:
+> **Note on ordering.** `profileView` was built as strategy 1 — it is genuinely the better endpoint. Live testing then showed LinkedIn now returns `410 Gone` for both `/profileView` and `/networkinfo`, so the order was inverted. The endpoint is retained rather than deleted: 410 is cheap to discover, and a retired-endpoint response is unambiguous, unlike a silent schema change.
 
-- A strategy that **fails to parse** falls through to the next one.
-- A strategy that gets **blocked** (`999`/`429`/`403`) aborts the chain immediately. Trying the next strategy on an identity LinkedIn just flagged only deepens the block.
+The chain distinguishes **three** failure modes, and the distinction is load-bearing:
+
+- **Blocked** (`999`/`429`/`403`/`401`) → abort the chain immediately. Trying the next strategy on an identity LinkedIn just flagged only deepens the block.
+- **Endpoint retired** (`410`) → fall through at once. The identity is healthy; this route simply no longer exists, and it must not be counted against the identity's health.
+- **Parse failure** → fall through to the next strategy.
+
+Collapsing the first two is a real bug, and it was one this codebase had: before live testing, `410` fell into the generic `>= 300` branch and was reported as `AUTH_FAILED`, which aborted the chain and would have made a retired endpoint look like an expired cookie.
 
 Every `queryId` is overridable by environment variable (`QID_PROFILE_CARDS`, …), so a rotation is a config change rather than a redeploy.
 
@@ -439,7 +458,8 @@ Symptom: strategy 1 works, strategy 2 returns empty. Fix without redeploying cod
 **Fundamental to the approach**
 
 - **This violates LinkedIn's Terms of Service.** The account whose cookie is used can be restricted or permanently banned. See [Legal](#legal).
-- **Session cookies expire.** `li_at` lasts roughly 12 months but is invalidated early by a password change, an explicit logout, or a security challenge. Expiry surfaces as `AUTH_FAILED` (502) and needs a manual cookie refresh — there is no automated re-login, deliberately, since automating login is what triggers CAPTCHA challenges most reliably.
+- **Session cookies expire, and can be killed early.** `li_at` nominally lasts ~12 months, but is invalidated by a password change, an explicit logout, a security challenge — or by LinkedIn deciding the cookie is being replayed (see [Why the whole jar matters](#why-the-whole-jar-matters)). Both surface as `AUTH_FAILED` (502) and need a manual cookie refresh. There is no automated re-login, deliberately: automating LinkedIn login is the single most reliable way to trigger a CAPTCHA challenge and lock the account.
+- **LinkedIn retires endpoints without notice.** `/profileView` and `/networkinfo` returned complete data for years and now return `410 Gone`. Nothing about this approach is stable by construction; the strategy chain limits the blast radius of any one retirement, it doesn't prevent them.
 - **`queryId` hashes rotate** with LinkedIn web builds and will eventually break strategy 2. Mitigated by ordering the queryId-free endpoint first and by env-var overrides, not eliminated.
 - **Datacenter IPs get blocked fast.** Without residential proxies, expect `999` responses from Cloud Run within tens of requests.
 
@@ -447,7 +467,8 @@ Symptom: strategy 1 works, strategy 2 returns empty. Fix without redeploying cod
 
 - **You only see what your account can see.** LinkedIn's visibility rules apply to the API exactly as they do in the browser: 3rd-degree connections show truncated experience, out-of-network profiles may show almost nothing, and some members hide sections entirely. An empty section is often a privacy setting, not a parsing bug — `meta.missingSections` is there to make that distinguishable.
 - **Recommendations, endorsement details, contact info and post activity are not extracted.** Each needs its own endpoint; the brief's field list doesn't include them.
-- **Skill endorsement counts are frequently `null`** — `profileView` returns skills without counts, and fetching them needs a per-skill call that isn't worth the rate-limit budget.
+- **Skill endorsement counts are frequently `null`** — the card surface returns skills without counts, and fetching them needs a per-skill call that isn't worth the rate-limit budget.
+- **Connection and follower counts may be `null`** — `/networkinfo` is retired (410), so these are read from the dash profile record where present.
 - **Image URLs are signed and expire** (typically ~30 days). `expiresAt` is reported; callers needing permanence must re-host the bytes.
 - **Company and school logos come from whichever entity LinkedIn attached** — a position at a company with no LinkedIn page has no logo.
 - **Nested multi-role positions** (several roles at one employer) are flattened into standalone entries with the company inherited. The grouping itself is not preserved.

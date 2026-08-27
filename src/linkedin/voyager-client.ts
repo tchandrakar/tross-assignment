@@ -23,21 +23,49 @@ const USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 /**
- * LinkedIn fingerprints this header. The values must be internally consistent
- * with the User-Agent above or the request is treated as automated.
+ * LinkedIn fingerprints this header and cross-checks it against the account's
+ * own cookies. Two mismatches observed to matter:
+ *
+ *   - Sending `timezone: UTC` while the account's `timezone` cookie says
+ *     `Asia/Calcutta` is an inconsistency a real browser never produces.
+ *   - A stale `clientVersion` marks the client as not-the-current-web-app.
+ *
+ * So the track header is derived per identity from its own cookie jar rather
+ * than being a fixed constant.
  */
-const X_LI_TRACK = JSON.stringify({
-  clientVersion: '1.13.30',
-  mpVersion: '1.13.30',
-  osName: 'web',
-  timezoneOffset: 0,
-  timezone: 'UTC',
-  deviceFormFactor: 'DESKTOP',
-  mpName: 'voyager-web',
-  displayDensity: 2,
-  displayWidth: 2560,
-  displayHeight: 1440,
-});
+const CLIENT_VERSION = process.env.LI_CLIENT_VERSION?.trim() || '1.13.36423';
+
+function buildTrackHeader(identity: Identity): string {
+  const timezone = identity.cookies.timezone || 'UTC';
+  return JSON.stringify({
+    clientVersion: CLIENT_VERSION,
+    mpVersion: CLIENT_VERSION,
+    osName: 'web',
+    timezoneOffset: timezoneOffsetHours(timezone),
+    timezone,
+    deviceFormFactor: 'DESKTOP',
+    mpName: 'voyager-web',
+    displayDensity: 2,
+    displayWidth: 2560,
+    displayHeight: 1440,
+  });
+}
+
+/** Current UTC offset in hours for an IANA zone, matching what the web client sends. */
+export function timezoneOffsetHours(timeZone: string): number {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone, timeZoneName: 'longOffset' })
+      .formatToParts(new Date())
+      .find((part) => part.type === 'timeZoneName')?.value;
+    // "GMT+05:30" → 5.5
+    const match = /GMT([+-])(\d{2}):(\d{2})/.exec(parts ?? '');
+    if (!match) return 0;
+    const sign = match[1] === '-' ? -1 : 1;
+    return sign * (Number(match[2]) + Number(match[3]) / 60);
+  } catch {
+    return 0;
+  }
+}
 
 export interface VoyagerResponse {
   status: number;
@@ -61,16 +89,35 @@ export function buildHeaders(identity: Identity, extra: Record<string, string> =
     'csrf-token': identity.csrfToken,
     'x-restli-protocol-version': '2.0.0',
     'x-li-lang': 'en_US',
-    'x-li-track': X_LI_TRACK,
+    'x-li-track': buildTrackHeader(identity),
     'user-agent': USER_AGENT,
     referer: 'https://www.linkedin.com/feed/',
     origin: 'https://www.linkedin.com',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin',
-    cookie: `li_at=${identity.liAt}; JSESSIONID="${identity.csrfToken}"`,
+    cookie: buildCookieHeader(identity),
     ...extra,
   };
+}
+
+/**
+ * LinkedIn validates the *set* of cookies, not just li_at. A session cookie
+ * arriving without the browser-identity cookies that normally accompany it
+ * (bcookie, bscookie, lidc, li_gc) looks like a replayed stolen cookie, and
+ * LinkedIn responds by invalidating the session server-side — a 302 carrying
+ * `set-cookie: li_at=delete me`. Sending the whole jar avoids that.
+ *
+ * li_at and JSESSIONID always win over anything in the jar, so a stale copy in
+ * a pasted cookie string can't shadow the configured credentials.
+ */
+export function buildCookieHeader(identity: Identity): string {
+  const jar: Record<string, string> = { ...identity.cookies };
+  jar.li_at = identity.liAt;
+  jar.JSESSIONID = `"${identity.csrfToken}"`;
+  return Object.entries(jar)
+    .map(([name, value]) => `${name}=${value}`)
+    .join('; ');
 }
 
 /** HTTP statuses that mean "LinkedIn pushed back", as opposed to "not found". */
@@ -150,15 +197,35 @@ export class VoyagerClient {
       throw new ApiError('PROFILE_NOT_FOUND', 'LinkedIn has no profile at that identifier.');
     }
 
+    // 410 Gone: LinkedIn has retired the endpoint outright. Distinct from a
+    // block — the identity is fine, this route just no longer exists — so the
+    // strategy chain should fall through rather than abort.
+    if (status === 410) {
+      throw new ApiError('ENDPOINT_RETIRED', `LinkedIn has retired ${url.replace(VOYAGER_BASE, '')} (410 Gone).`, {
+        details: { status, path },
+      });
+    }
+
     if (status >= 500) {
       throw new ApiError('UPSTREAM_BLOCKED', `LinkedIn returned a server error (${status}).`, { details: { status } });
     }
 
     if (status >= 300) {
-      // A redirect to /authwall or /login means the session isn't authenticated.
-      throw new ApiError('AUTH_FAILED', `Unexpected redirect (${status}) — the session is probably not logged in.`, {
-        details: { status, location: response.headers.location },
-      });
+      // A redirect whose Set-Cookie clears li_at is LinkedIn actively killing
+      // the session — it decided the cookie was being replayed. Distinguish it
+      // from an ordinary auth-wall bounce, because the remedy differs: this one
+      // needs a fresh login, and re-trying only burns the account further.
+      const setCookie = response.headers['set-cookie'];
+      const cleared = (Array.isArray(setCookie) ? setCookie.join(';') : String(setCookie ?? '')).includes('li_at=delete me');
+
+      throw new ApiError(
+        'AUTH_FAILED',
+        cleared
+          ? `LinkedIn invalidated the session for identity "${identity.label}" mid-request. This usually means the ` +
+            'cookie was sent without the supporting browser cookies (bcookie, bscookie, lidc) — see README §Session cookies.'
+          : `Unexpected redirect (${status}) — the session is probably not logged in.`,
+        { details: { status, sessionInvalidated: cleared, identity: identity.label } },
+      );
     }
 
     let body: unknown;

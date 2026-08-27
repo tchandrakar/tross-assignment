@@ -10,3 +10,4 @@ coverage/
 *.local
 cookies.json
 secrets/
+.sessions/

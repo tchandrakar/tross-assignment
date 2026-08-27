@@ -7,12 +7,14 @@
     "node": ">=20"
   },
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx watch --env-file-if-exists=.env src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "start:local": "node --env-file-if-exists=.env dist/index.js",
+    "login": "tsx --env-file-if-exists=.env src/browser/login-cli.ts"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",

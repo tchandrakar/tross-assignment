@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { VoyagerClient, buildHeaders, isBlockStatus } from '../src/linkedin/voyager-client.js';
+import { VoyagerClient, buildHeaders, isBlockStatus, timezoneOffsetHours } from '../src/linkedin/voyager-client.js';
 import { IdentityPool } from '../src/identity/pool.js';
 import { ApiError } from '../src/errors.js';
 import type { AppConfig } from '../src/config.js';
@@ -90,5 +90,40 @@ describe('VoyagerClient.withIdentity', () => {
 
     const cooling = pool.health().filter((h) => h.state === 'cooling-down');
     expect(cooling.length).toBeGreaterThan(0);
+  });
+});
+
+describe('timezoneOffsetHours', () => {
+  it('resolves a half-hour offset zone', () => {
+    expect(timezoneOffsetHours('Asia/Calcutta')).toBe(5.5);
+  });
+
+  it('resolves a negative offset zone', () => {
+    expect(timezoneOffsetHours('America/New_York')).toBeLessThan(0);
+  });
+
+  it('returns 0 for UTC', () => {
+    expect(timezoneOffsetHours('UTC')).toBe(0);
+  });
+
+  it('falls back to 0 for an unknown zone rather than throwing', () => {
+    expect(timezoneOffsetHours('Not/AZone')).toBe(0);
+  });
+});
+
+describe('x-li-track fidelity', () => {
+  it('mirrors the account timezone cookie instead of hardcoding UTC', () => {
+    const pool = new IdentityPool(
+      config([{ ...identity('a'), cookies: { timezone: 'Asia/Calcutta' } }]),
+    );
+    const track = JSON.parse(buildHeaders(pool.acquire())['x-li-track']!);
+    expect(track.timezone).toBe('Asia/Calcutta');
+    expect(track.timezoneOffset).toBe(5.5);
+  });
+
+  it('defaults to UTC when the jar carries no timezone', () => {
+    const track = JSON.parse(buildHeaders(new IdentityPool(config([identity('a')])).acquire())['x-li-track']!);
+    expect(track.timezone).toBe('UTC');
+    expect(track.timezoneOffset).toBe(0);
   });
 });

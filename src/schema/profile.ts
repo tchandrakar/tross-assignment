@@ -163,7 +163,13 @@ export const profileSchema = z.object({
   volunteering: z.array(volunteerSchema).default([]),
 });
 
-export const sourceSchema = z.enum(['voyager-profile-view', 'voyager-graphql', 'browser', 'cache']);
+export const sourceSchema = z.enum([
+  'browser-voyager',
+  'voyager-graphql',
+  'voyager-profile-view',
+  'browser',
+  'cache',
+]);
 
 export const metaSchema = z.object({
   /** Whether this response was served from the blob cache without touching LinkedIn. */
