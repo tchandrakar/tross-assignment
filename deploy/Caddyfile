@@ -1,21 +1,36 @@
-# Automatic HTTPS via Let's Encrypt. Caddy provisions and renews the
-# certificate itself, so there is no cert material in the repo or in CI.
-{$PUBLIC_HOST} {
+# Common proxy behaviour for every entry point below.
+(app) {
 	encode gzip
 
-	# Never let a scraper API be indexed or embedded.
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		X-Content-Type-Options "nosniff"
+		# A scraper API has no business being indexed or embedded.
 		X-Robots-Tag "noindex, nofollow"
 		-Server
 	}
 
 	reverse_proxy api:8080 {
-		# A cold browser launch plus a live scrape can legitimately take a
-		# while; the app's own timeouts are the real limit.
+		# A cold browser launch plus a live scrape legitimately takes a while;
+		# the app's own timeouts are the real limit.
 		transport http {
 			read_timeout 180s
 		}
 	}
+}
+
+# Canonical endpoint. Caddy provisions and renews the certificate itself, so no
+# certificate material lives in the repo or in CI.
+{$PUBLIC_HOST} {
+	import app
+}
+
+# Plain-HTTP fallback on whatever address the request arrived at.
+#
+# This exists because TLS cannot be issued until the DNS record points here, and
+# without it the deployment would be unverifiable in the meantime — you could
+# not tell "DNS not pointed yet" apart from "the service is broken". It serves
+# the same app; the canonical host above is the one to use.
+:80 {
+	import app
 }
