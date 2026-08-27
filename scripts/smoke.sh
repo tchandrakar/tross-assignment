@@ -18,20 +18,47 @@ auth_args() { if [[ ${#AUTH[@]} -gt 0 ]]; then printf '%s\n' "${AUTH[@]}"; fi; }
 pass() { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
+# The service enforces a per-caller rate limit, and this script is a caller like
+# any other. Rather than tripping it and reporting a false failure, honour it:
+# on a 429, wait for the retry-after the service itself supplied.
+MAX_RETRIES=6
+
 code() {
-  if [[ ${#AUTH[@]} -gt 0 ]]; then
-    curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$@"
-  else
-    curl -s -o /dev/null -w '%{http_code}' "$@"
-  fi
+  local attempt status
+  for ((attempt = 1; attempt <= MAX_RETRIES; attempt++)); do
+    if [[ ${#AUTH[@]} -gt 0 ]]; then
+      status=$(curl -s -o /dev/null -D /tmp/.smoke-hdr -w '%{http_code}' "${AUTH[@]}" "$@")
+    else
+      status=$(curl -s -o /dev/null -D /tmp/.smoke-hdr -w '%{http_code}' "$@")
+    fi
+    [[ "$status" != "429" ]] && { printf '%s' "$status"; return; }
+    sleep "$(retry_after)"
+  done
+  printf '%s' "$status"
 }
 
 get() {
-  if [[ ${#AUTH[@]} -gt 0 ]]; then
-    curl -s "${AUTH[@]}" "$@"
-  else
-    curl -s "$@"
-  fi
+  local attempt out
+  for ((attempt = 1; attempt <= MAX_RETRIES; attempt++)); do
+    if [[ ${#AUTH[@]} -gt 0 ]]; then
+      out=$(curl -s -D /tmp/.smoke-hdr "${AUTH[@]}" "$@")
+    else
+      out=$(curl -s -D /tmp/.smoke-hdr "$@")
+    fi
+    if ! grep -qi '^HTTP/[0-9.]* 429' /tmp/.smoke-hdr 2>/dev/null; then
+      printf '%s' "$out"
+      return
+    fi
+    sleep "$(retry_after)"
+  done
+  printf '%s' "$out"
+}
+
+# Seconds to wait, taken from the response the service just sent.
+retry_after() {
+  local value
+  value=$(grep -i '^retry-after:' /tmp/.smoke-hdr 2>/dev/null | tr -d '\r' | awk '{print $2}' | head -1)
+  [[ "$value" =~ ^[0-9]+$ ]] && printf '%s' "$((value + 1))" || printf '5'
 }
 
 [[ "$(code "${BASE}/healthz")" == "200" ]] || fail "liveness probe failed"
