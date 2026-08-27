@@ -38,8 +38,6 @@ jobs:
     # Still build when tests were deliberately skipped.
     if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
     runs-on: ubuntu-latest
-    outputs:
-      image: ${{ steps.meta.outputs.image }}
     steps:
       - uses: actions/checkout@v4
 
@@ -52,6 +50,11 @@ jobs:
       - name: Configure Artifact Registry auth
         run: gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev --quiet
 
+      # NOTE: the image reference is deliberately NOT a job output. It embeds
+      # secret values (region, project), and GitHub redacts secrets from job
+      # outputs — the output arrives at the next job as an empty string, which
+      # surfaces much later as "service api has neither an image nor a build
+      # context". Each job derives the reference from the same inputs instead.
       - id: meta
         run: |
           REG="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT }}/${AR_REPO}/${IMAGE_NAME}"
@@ -107,10 +110,12 @@ jobs:
       - name: Render deployment files
         run: |
           mkdir -p out
+          # Rebuilt here rather than passed from `build` — see the note there.
+          IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT }}/${AR_REPO}/${IMAGE_NAME}:${GITHUB_SHA::12}"
           cp deploy/docker-compose.yml deploy/Caddyfile deploy/rollout.sh out/
           # Written on the runner, copied to the VM, never committed.
           cat > out/.env <<ENVFILE
-          IMAGE=${{ needs.build.outputs.image }}
+          IMAGE=${IMAGE}
           PUBLIC_HOST=${{ secrets.PUBLIC_HOST }}
           PUBLIC_BASE_URL=https://${{ secrets.PUBLIC_HOST }}
           GCS_BUCKET=${{ secrets.GCS_BUCKET }}
@@ -125,6 +130,13 @@ jobs:
           PROXY_URLS=${{ secrets.PROXY_URLS }}
           PROXY_STICKY_TEMPLATE=${{ secrets.PROXY_STICKY_TEMPLATE }}
           ENVFILE
+
+          if ! grep -qE '^IMAGE=.+:.+$' out/.env; then
+            echo "::error::Rendered IMAGE is empty or malformed — refusing to deploy."
+            sed 's/\(PASSWORD\|EMAIL\)=.*/\1=***/' out/.env
+            exit 1
+          fi
+          echo "deploying image: $(grep '^IMAGE=' out/.env)"
 
       - name: Wait for the VM to accept SSH
         run: |
