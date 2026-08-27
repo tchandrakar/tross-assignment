@@ -23,6 +23,11 @@ services:
       SCRAPE_RATE_PER_MINUTE: ${SCRAPE_RATE_PER_MINUTE:-5}
       ENABLE_BROWSER_FALLBACK: "true"
       ENABLE_HTTP_TRANSPORT: "false"
+      # Credentials for automatic session bootstrap. The service uses them only
+      # when it has no valid stored session — normally never, because the
+      # session in GCS survives redeploys.
+      LI_EMAIL: ${LI_EMAIL:-}
+      LI_PASSWORD: ${LI_PASSWORD:-}
       API_KEYS: ${API_KEYS:-}
       PROXY_URLS: ${PROXY_URLS:-}
       PROXY_STICKY_TEMPLATE: ${PROXY_STICKY_TEMPLATE:-}

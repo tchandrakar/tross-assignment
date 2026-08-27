@@ -2,8 +2,9 @@ import type { Browser, BrowserContext, Page } from 'playwright';
 import type { FastifyBaseLogger } from 'fastify';
 import { ApiError } from '../errors.js';
 import type { Identity } from '../identity/pool.js';
-import type { SessionStore } from './session-store.js';
+import type { SessionStore, StorageState } from './session-store.js';
 import { NullSessionStore } from './session-store.js';
+import { LoginChallengeError, performLogin } from './login.js';
 
 /**
  * A warmed, authenticated Chromium session per identity.
@@ -61,10 +62,81 @@ export class BrowserSession {
   private launching: Promise<Browser> | null = null;
   private readonly contexts = new Map<string, CachedContext>();
 
+  /**
+   * In-flight automatic logins, keyed by identity. A burst of requests against
+   * a cold service would otherwise each start their own login, and several
+   * simultaneous logins from one account is a reliable way to get challenged.
+   */
+  private readonly logins = new Map<string, Promise<StorageState>>();
+
   constructor(
     private readonly logger: FastifyBaseLogger,
     private readonly store: SessionStore = new NullSessionStore(),
+    /**
+     * Optional credentials for automatic session bootstrap. When present, a
+     * cold start (or an invalidated session) re-establishes itself without a
+     * human — which is what makes a deploy self-sufficient.
+     */
+    private readonly credentials: { email: string; password: string } | null = null,
   ) {}
+
+  /**
+   * Establishes a session by logging in, headlessly. Deduplicated per identity.
+   *
+   * This is best-effort by nature: LinkedIn challenges automated logins far
+   * more often than human ones, and a challenge cannot be answered on a server.
+   * When that happens the error says so explicitly, so the operator knows to
+   * run `npm run login` rather than hunting a phantom bug.
+   */
+  private async autoLogin(identity: Identity): Promise<StorageState> {
+    const existing = this.logins.get(identity.id);
+    if (existing) {
+      this.logger.debug({ identity: identity.label }, 'joining in-flight automatic login');
+      return existing;
+    }
+
+    if (!this.credentials) {
+      throw new ApiError(
+        'AUTH_FAILED',
+        `Identity "${identity.label}" has no stored session, no cookie seed, and no credentials configured. ` +
+          'Set LI_EMAIL and LI_PASSWORD, or run `npm run login` and upload the session.',
+      );
+    }
+
+    const attempt = (async () => {
+      this.logger.info({ identity: identity.label }, 'no usable session — attempting automatic login');
+
+      const { firstName, state } = await performLogin({
+        email: this.credentials!.email,
+        password: this.credentials!.password,
+        interactive: false,
+        timezoneId: isValidTimezone(identity.cookies.timezone ?? '') ? identity.cookies.timezone : undefined,
+        ...(identity.proxyUrl ? { proxy: toPlaywrightProxy(identity.proxyUrl) } : {}),
+        log: (message) => { if (message) this.logger.debug({ identity: identity.label }, message); },
+      });
+
+      await this.store.save(identity.id, state as StorageState);
+      this.logger.info({ identity: identity.label, account: firstName }, 'automatic login succeeded; session stored');
+      return state as StorageState;
+    })().finally(() => {
+      this.logins.delete(identity.id);
+    });
+
+    this.logins.set(identity.id, attempt);
+
+    try {
+      return await attempt;
+    } catch (error) {
+      if (error instanceof LoginChallengeError) {
+        throw new ApiError('AUTH_FAILED', error.message, { cause: error, details: { identity: identity.label, needsHuman: true } });
+      }
+      throw new ApiError(
+        'AUTH_FAILED',
+        `Automatic login failed for identity "${identity.label}": ${(error as Error).message}`,
+        { cause: error, details: { identity: identity.label } },
+      );
+    }
+  }
 
   private async getBrowser(): Promise<Browser> {
     if (this.browser?.isConnected()) return this.browser;
@@ -106,8 +178,12 @@ export class BrowserSession {
     const timezone = identity.cookies.timezone || 'UTC';
 
     // Prefer persisted state: it holds whatever li_at LinkedIn most recently
-    // rotated to. The configured cookie jar is only a bootstrap seed.
-    const persisted = await this.store.load(identity.id).catch(() => null);
+    // rotated to. The configured cookie jar is only a bootstrap seed, and
+    // credentials are the last resort that makes a cold deploy self-healing.
+    let persisted = await this.store.load(identity.id).catch(() => null);
+    if (!persisted && !identity.liAt && this.credentials) {
+      persisted = await this.autoLogin(identity);
+    }
 
     const context = await browser.newContext({
       userAgent: UA,
@@ -125,7 +201,8 @@ export class BrowserSession {
         await context.close().catch(() => undefined);
         throw new ApiError(
           'AUTH_FAILED',
-          `Identity "${identity.label}" has no stored session and no cookie seed. Run \`npm run login\` to establish one.`,
+          `Identity "${identity.label}" has no stored session, no cookie seed and no credentials. ` +
+            'Run `npm run login` to establish one.',
           { details: { identity: identity.label } },
         );
       }
@@ -335,7 +412,10 @@ export class BrowserSession {
   async invalidate(identity: Identity): Promise<void> {
     await this.dispose(identity.id);
     await this.store.clear(identity.id).catch(() => undefined);
-    this.logger.warn({ identity: identity.label }, 'cleared persisted session state after auth failure');
+    this.logger.warn(
+      { identity: identity.label, willRelogin: this.credentials !== null },
+      'cleared persisted session state after auth failure',
+    );
   }
 
   /** Drops a poisoned context so the next call re-warms from scratch. */

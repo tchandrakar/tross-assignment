@@ -133,6 +133,137 @@ async function whoAmI(page: Page): Promise<{ status: number; firstName: string |
   return { status: result.status, firstName: /"firstName":"([^"]*)"/.exec(result.body)?.[1] ?? null };
 }
 
+export interface LoginOptions {
+  email: string;
+  password: string;
+  /**
+   * Headed, with a long pause for a human to clear a CAPTCHA or type an emailed
+   * code. False on a server, where nobody is watching — there, a challenge is a
+   * hard failure rather than something to wait on.
+   */
+  interactive: boolean;
+  /** Where a failure screenshot is written. */
+  screenshotPath?: string;
+  proxy?: { server: string; username?: string; password?: string };
+  timezoneId?: string;
+  log?: (message: string) => void;
+}
+
+export interface LoginResult {
+  firstName: string | null;
+  state: unknown;
+}
+
+/**
+ * Performs the login and returns the resulting storage state. Shared by the
+ * interactive CLI and the server's automatic bootstrap, so there is one login
+ * implementation rather than two that can drift.
+ */
+export async function performLogin(options: LoginOptions): Promise<LoginResult> {
+  const { email, password, interactive } = options;
+  const log = options.log ?? (() => {});
+  const shotPath = options.screenshotPath;
+
+  const browser = await chromium.launch({
+    headless: !interactive,
+    args: [
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+    ],
+    ...(interactive ? { slowMo: 40 } : {}),
+  });
+
+  const context = await browser.newContext({
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    viewport: { width: 1440, height: 900 },
+    locale: 'en-US',
+    timezoneId: options.timezoneId || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    ...(options.proxy ? { proxy: options.proxy } : {}),
+  });
+
+  const page = await context.newPage();
+
+  try {
+    log('opening LinkedIn login');
+    await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await sleep(1_500);
+
+    // An existing browser session may already be valid.
+    if (!page.url().includes('/login') && !page.url().includes('/uas/')) {
+      const existing = await whoAmI(page);
+      if (existing.status === 200) {
+        log(`already signed in as ${existing.firstName ?? '(unknown)'}`);
+        return { firstName: existing.firstName, state: await context.storageState() };
+      }
+    }
+
+    await idleMouse(page);
+
+    log('locating the login form');
+    const emailField = await firstVisible(page, EMAIL_SELECTORS, 'email');
+    const passwordField = await firstVisible(page, PASSWORD_SELECTORS, 'password');
+
+    log('filling credentials (never logged, never stored)');
+    await typeLikeHuman(emailField, email);
+    await typeLikeHuman(passwordField, password);
+    await idleMouse(page);
+
+    log('submitting');
+    await clickSignIn(page);
+    await page.waitForLoadState('domcontentloaded').catch(() => undefined);
+    await sleep(5_000);
+
+    if (CHALLENGE_MARKERS.some((marker) => page.url().includes(marker))) {
+      if (!interactive) {
+        // Nobody is watching on a server. Fail clearly rather than hanging for
+        // five minutes on a challenge that will never be answered.
+        if (shotPath) await page.screenshot({ path: shotPath }).catch(() => undefined);
+        throw new LoginChallengeError(
+          `LinkedIn presented a verification challenge (${page.url()}) and no human is available to clear it. ` +
+            'Run `npm run login` locally and upload the resulting session.',
+        );
+      }
+
+      log('');
+      log('LinkedIn presented a verification challenge.');
+      log('Complete it in the browser window that just opened —');
+      log('CAPTCHA, emailed code, or device confirmation. Waiting up to 5 minutes…');
+      log('');
+
+      await page.waitForURL((url) => !CHALLENGE_MARKERS.some((m) => url.toString().includes(m)), {
+        timeout: 300_000,
+      });
+      await sleep(3_000);
+    }
+
+    const me = await whoAmI(page);
+    if (me.status !== 200) {
+      if (shotPath) await page.screenshot({ path: shotPath, fullPage: false }).catch(() => undefined);
+      throw new Error(
+        `Login did not complete: /voyager/api/me returned ${me.status}. Current URL: ${page.url()}` +
+          (shotPath ? `. Screenshot: ${shotPath}` : ''),
+      );
+    }
+
+    log(`logged in as ${me.firstName ?? '(unknown)'}`);
+    return { firstName: me.firstName, state: await context.storageState() };
+  } catch (error) {
+    if (shotPath) await page.screenshot({ path: shotPath, fullPage: false }).catch(() => undefined);
+    throw error;
+  } finally {
+    await context.close().catch(() => undefined);
+    await browser.close().catch(() => undefined);
+  }
+}
+
+/** Distinguishes "needs a human" from "credentials are wrong". */
+export class LoginChallengeError extends Error {
+  override name = 'LoginChallengeError';
+}
+
+/** CLI entry point: headed, writes to the local session store. */
 export async function runLogin(): Promise<void> {
   const config = getConfig();
 
@@ -147,93 +278,21 @@ export async function runLogin(): Promise<void> {
   const identityId = label.replace(/[^a-zA-Z0-9._-]/g, '_');
   const store = new FileSessionStore(config.sessionStateDir);
   await mkdir(config.sessionStateDir, { recursive: true });
-  const shotPath = `${config.sessionStateDir}/login-failure.png`;
 
-  // Headed on purpose: you may need to clear a CAPTCHA or type an emailed code.
-  const browser = await chromium.launch({
-    headless: false,
-    args: ['--disable-blink-features=AutomationControlled'],
-    slowMo: 40,
+  const { firstName, state } = await performLogin({
+    email: config.loginEmail,
+    password: config.loginPassword,
+    interactive: true,
+    screenshotPath: `${config.sessionStateDir}/login-failure.png`,
+    log: (m) => console.log(m ? `→ ${m}` : ''),
   });
 
-  const context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    viewport: { width: 1440, height: 900 },
-    locale: 'en-US',
-    timezoneId: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
-  });
+  await store.save(identityId, state as never);
 
-  const page = await context.newPage();
-
-  try {
-    console.log('→ opening LinkedIn login…');
-    await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    await sleep(1_500);
-
-    // An existing browser session may already be valid.
-    if (!page.url().includes('/login') && !page.url().includes('/uas/')) {
-      const existing = await whoAmI(page);
-      if (existing.status === 200) {
-        await store.save(identityId, (await context.storageState()) as never);
-        console.log(`✓ already signed in as ${existing.firstName ?? '(unknown)'} — session saved.`);
-        return;
-      }
-    }
-
-    await idleMouse(page);
-
-    console.log('→ locating the login form…');
-    const email = await firstVisible(page, EMAIL_SELECTORS, 'email');
-    const password = await firstVisible(page, PASSWORD_SELECTORS, 'password');
-
-    console.log('→ filling credentials (not logged, not stored)…');
-    await typeLikeHuman(email, config.loginEmail);
-    await typeLikeHuman(password, config.loginPassword);
-    await idleMouse(page);
-
-    console.log('→ submitting…');
-    await clickSignIn(page);
-    await page.waitForLoadState('domcontentloaded').catch(() => undefined);
-    await sleep(5_000);
-
-    if (CHALLENGE_MARKERS.some((marker) => page.url().includes(marker))) {
-      console.log('');
-      console.log('⚠  LinkedIn presented a verification challenge.');
-      console.log('   Complete it in the browser window that just opened —');
-      console.log('   CAPTCHA, emailed code, or device confirmation.');
-      console.log('   Waiting up to 5 minutes…');
-      console.log('');
-
-      await page.waitForURL((url) => !CHALLENGE_MARKERS.some((m) => url.toString().includes(m)), {
-        timeout: 300_000,
-      });
-      await sleep(3_000);
-    }
-
-    const me = await whoAmI(page);
-    if (me.status !== 200) {
-      await page.screenshot({ path: shotPath, fullPage: false }).catch(() => undefined);
-      throw new Error(
-        `Login did not complete: /voyager/api/me returned ${me.status}. ` +
-          `Current URL: ${page.url()}. Screenshot: ${shotPath}`,
-      );
-    }
-
-    await store.save(identityId, (await context.storageState()) as never);
-
-    console.log('');
-    console.log(`✓ logged in as ${me.firstName ?? '(unknown)'}`);
-    console.log(`✓ session saved for identity "${label}" → ${config.sessionStateDir}/${identityId}.json`);
-    console.log('');
-    console.log('  That file is a live session — gitignored, mode 0600. Do not commit or share it.');
-    console.log('  You can now remove LI_PASSWORD from .env; the server never reads it.');
-    console.log('  Start the API with: npm run dev');
-  } catch (error) {
-    await page.screenshot({ path: shotPath, fullPage: false }).catch(() => undefined);
-    throw error;
-  } finally {
-    await context.close().catch(() => undefined);
-    await browser.close().catch(() => undefined);
-  }
+  console.log('');
+  console.log(`✓ logged in as ${firstName ?? '(unknown)'}`);
+  console.log(`✓ session saved for identity "${label}" → ${config.sessionStateDir}/${identityId}.json`);
+  console.log('');
+  console.log('  That file is a live session — gitignored, mode 0600. Do not commit or share it.');
+  console.log('  Start the API with: npm run dev');
 }

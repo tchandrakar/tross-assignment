@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { Storage } from '@google-cloud/storage';
 
@@ -50,7 +50,9 @@ export class FileSessionStore implements SessionStore {
     try {
       const raw = await readFile(this.path(identityId), 'utf8');
       const parsed = JSON.parse(raw) as StorageState;
-      return Array.isArray(parsed?.cookies) ? parsed : null;
+      // An empty jar is not a session — treat it as absent so the caller
+      // re-establishes rather than making an unauthenticated request.
+      return Array.isArray(parsed?.cookies) && parsed.cookies.length > 0 ? parsed : null;
     } catch {
       return null;
     }
@@ -64,9 +66,9 @@ export class FileSessionStore implements SessionStore {
   }
 
   async clear(identityId: string): Promise<void> {
-    await writeFile(this.path(identityId), JSON.stringify({ cookies: [], origins: [] }), { mode: 0o600 }).catch(
-      () => undefined,
-    );
+    // Remove rather than blank: load() must return null so the caller falls
+    // through to re-login instead of using an empty cookie jar.
+    await rm(this.path(identityId), { force: true }).catch(() => undefined);
   }
 }
 
@@ -92,7 +94,7 @@ export class GcsSessionStore implements SessionStore {
     try {
       const [buffer] = await this.file(identityId).download();
       const parsed = JSON.parse(buffer.toString('utf8')) as StorageState;
-      return Array.isArray(parsed?.cookies) ? parsed : null;
+      return Array.isArray(parsed?.cookies) && parsed.cookies.length > 0 ? parsed : null;
     } catch (error) {
       if ((error as { code?: number }).code === 404) return null;
       throw error;

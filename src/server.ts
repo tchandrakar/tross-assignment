@@ -65,7 +65,14 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
     ? new GcsSessionStore(new Storage(), config.gcsBucket)
     : new FileSessionStore(config.sessionStateDir);
 
-  const browserSession = config.enableBrowserFallback ? new BrowserSession(app.log, sessionStore) : null;
+  const credentials =
+    config.loginEmail && config.loginPassword
+      ? { email: config.loginEmail, password: config.loginPassword }
+      : null;
+
+  const browserSession = config.enableBrowserFallback
+    ? new BrowserSession(app.log, sessionStore, credentials)
+    : null;
   const scraper = new ProfileScraper(pool, app.log, browserSession, config.enableHttpTransport);
   const service = new ProfileService(scraper, cache, limiter, config, app.log);
 
