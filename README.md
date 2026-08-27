@@ -77,6 +77,14 @@ Service status, dependency health, and remaining quota across all three rate
 limit tiers. Never rate limited — the endpoint that reports remaining quota must
 stay reachable precisely when a caller is being throttled.
 
+### `POST /v1/admin/session/reset`
+
+Clears the automatic-login circuit breaker and drops live browser sessions, so
+the next request re-establishes the upstream session from scratch. Intended for
+recovery after a corrected credential, so that fixing configuration takes effect
+immediately rather than after a timeout or a redeploy. Protected by the API key
+when one is configured.
+
 ### `GET /healthz`
 
 Liveness only. Touches no dependency, so an upstream problem cannot cause the
@@ -247,6 +255,10 @@ These hold everywhere in the response, and each exists for a reason:
 | `ENDPOINT_RETIRED` | 502 | LinkedIn has withdrawn an endpoint | Operator action |
 | `UPSTREAM_BLOCKED` | 503 | LinkedIn rejected the request | Retry after `retryAfterSeconds` |
 | `NO_IDENTITY_AVAILABLE` | 503 | All upstream identities are cooling down or quarantined | Retry later |
+
+`GET /health` reports `loginHealth`. A non-empty array means automatic
+re-authentication is failing; `suspended: true` means the circuit breaker has
+tripped and operator action is required.
 
 ---
 

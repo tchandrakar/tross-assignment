@@ -562,6 +562,37 @@ export class BrowserSession {
     await live.context.close().catch(() => undefined);
   }
 
+  /**
+   * Clears the automatic-login circuit breaker and drops any live session, so
+   * the next request re-establishes from scratch.
+   *
+   * Exists so that fixing a credential takes effect immediately. Without it,
+   * recovery would mean either waiting out the breaker or redeploying — both
+   * poor answers to "the password is corrected, try again".
+   */
+  async resetLoginBreaker(identity?: Identity): Promise<{ cleared: string[] }> {
+    const targets = identity ? [identity.id] : [...new Set([...this.loginFailures.keys(), ...this.sessions.keys()])];
+
+    for (const id of targets) {
+      this.loginFailures.delete(id);
+      await this.dispose(id);
+    }
+
+    this.logger.info({ identities: targets }, 'login circuit breaker reset; sessions dropped');
+    return { cleared: targets };
+  }
+
+  /** Per-identity automatic-login failure state, for the health endpoint. */
+  loginHealth(): Array<{ identity: string; consecutiveFailures: number; suspended: boolean; lastError: string }> {
+    const now = Date.now();
+    return [...this.loginFailures.entries()].map(([identity, f]) => ({
+      identity,
+      consecutiveFailures: f.count,
+      suspended: f.count >= MAX_LOGIN_FAILURES && now < f.blockedUntil,
+      lastError: f.lastError,
+    }));
+  }
+
   stats(): SessionStats[] {
     const now = Date.now();
     return [...this.sessions.entries()].map(([identity, live]) => ({
