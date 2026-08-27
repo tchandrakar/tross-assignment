@@ -54,8 +54,15 @@ const MAX_LOGIN_FAILURES = 3;
 /** How long automatic login stays suspended after tripping the breaker. */
 const LOGIN_BLOCK_MS = 30 * 60_000;
 
-/** How long an unanswered challenge holds its browser open before being reaped. */
-const CHALLENGE_TTL_MS = 20 * 60_000;
+/**
+ * How long an unanswered challenge holds its browser open before being reaped.
+ *
+ * Sized for a human round-trip: someone has to receive an email, read a code and
+ * deliver it. An earlier 20-minute window expired mid-handover and forced a
+ * fresh sign-in — which issues a fresh challenge, so the short timeout actively
+ * made recovery harder.
+ */
+const CHALLENGE_TTL_MS = 45 * 60_000;
 
 /**
  * Runs in the page. Confirms the session against the API rather than the DOM —

@@ -69,10 +69,13 @@ export function registerHealthRoutes(
    */
   app.post('/v1/admin/session/reset', async () => {
     if (!deps.browserSession) {
-      return { success: true as const, cleared: [], note: 'browser transport is disabled' };
+      return { success: true as const, cleared: [], identitiesReleased: deps.pool.release() };
     }
     const { cleared } = await deps.browserSession.resetLoginBreaker();
-    return { success: true as const, cleared };
+    // Same reasoning as the challenge endpoint: a reset is an operator saying
+    // "the cause is fixed", so accumulated backoff should not outlive it.
+    const released = deps.pool.release();
+    return { success: true as const, cleared, identitiesReleased: released };
   });
 
   /**
@@ -92,7 +95,13 @@ export function registerHealthRoutes(
     }
 
     const result = await deps.browserSession.submitChallengeCode(code, request.body?.identity);
-    return { success: true as const, ...result };
+
+    // Release identity cooldowns too. The backoff was accumulated by the very
+    // failures this challenge has just resolved; leaving it in place would keep
+    // the service unavailable after a successful recovery.
+    const released = deps.pool.release();
+
+    return { success: true as const, ...result, identitiesReleased: released };
   });
 
   app.get('/', async (_request, reply) => reply.redirect('/docs', 302));

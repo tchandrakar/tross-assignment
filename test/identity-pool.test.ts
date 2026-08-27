@@ -130,3 +130,33 @@ describe('IdentityPool', () => {
     expect(pool.health()[0]?.state).toBe('available');
   });
 });
+
+describe('IdentityPool.release', () => {
+  it('clears cooldown so a resolved cause restores service immediately', () => {
+    const pool = new IdentityPool(baseConfig({ identities: [identity('a')] }));
+    pool.reportFailure(pool.acquire(), true);
+    expect(pool.health()[0]?.state).toBe('cooling-down');
+
+    // What the challenge/reset endpoints call once the cause is resolved: the
+    // accumulated backoff was earned by failures that no longer apply.
+    expect(pool.release()).toBe(1);
+    expect(pool.health()[0]).toMatchObject({ state: 'available', consecutiveFailures: 0 });
+    expect(() => pool.acquire()).not.toThrow();
+  });
+
+  it('releases every identity when no label is given', () => {
+    const pool = new IdentityPool(baseConfig({ identities: [identity('a'), identity('b')] }));
+    for (const id of [pool.acquire(), pool.acquire()]) pool.reportFailure(id, true);
+    expect(pool.release()).toBe(2);
+    expect(pool.health().every((h) => h.state === 'available')).toBe(true);
+  });
+
+  it('releases only the named identity when one is given', () => {
+    const pool = new IdentityPool(baseConfig({ identities: [identity('a'), identity('b')] }));
+    for (const id of [pool.acquire(), pool.acquire()]) pool.reportFailure(id, true);
+    expect(pool.release('a')).toBe(1);
+    const byLabel = Object.fromEntries(pool.health().map((h) => [h.label, h.state]));
+    expect(byLabel.a).toBe('available');
+    expect(byLabel.b).toBe('cooling-down');
+  });
+});
