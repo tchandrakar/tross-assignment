@@ -107,7 +107,7 @@ jobs:
       - name: Render deployment files
         run: |
           mkdir -p out
-          cp deploy/docker-compose.yml deploy/Caddyfile out/
+          cp deploy/docker-compose.yml deploy/Caddyfile deploy/rollout.sh out/
           # Written on the runner, copied to the VM, never committed.
           cat > out/.env <<ENVFILE
           IMAGE=${{ needs.build.outputs.image }}
@@ -143,29 +143,20 @@ jobs:
 
       - name: Copy deployment files to the VM
         run: |
-          gcloud compute scp --recurse out/docker-compose.yml out/Caddyfile out/.env \
+          # Clear any leftovers from a previous run before copying.
+          gcloud compute ssh "${{ secrets.GCP_VM }}" --zone "${{ secrets.GCP_ZONE }}" \
+            --project "${{ secrets.GCP_PROJECT }}" --quiet \
+            --command 'rm -rf ~/deploy-staging && mkdir -p ~/deploy-staging'
+          gcloud compute scp --recurse \
+            out/docker-compose.yml out/Caddyfile out/rollout.sh out/.env \
             "${{ secrets.GCP_VM }}:~/deploy-staging/" \
             --zone "${{ secrets.GCP_ZONE }}" --project "${{ secrets.GCP_PROJECT }}" --quiet
 
       - name: Roll out
         run: |
           gcloud compute ssh "${{ secrets.GCP_VM }}" --zone "${{ secrets.GCP_ZONE }}" \
-            --project "${{ secrets.GCP_PROJECT }}" --quiet --command '
-              set -Eeuo pipefail
-              sudo mkdir -p /opt/linkedin-api
-              sudo mv ~/deploy-staging/* /opt/linkedin-api/
-              sudo chmod 600 /opt/linkedin-api/.env
-              cd /opt/linkedin-api
-
-              # The VM service account has Artifact Registry read via its
-              # cloud-platform scope; this wires docker up to use it.
-              gcloud auth configure-docker "$(grep -oP "(?<=IMAGE=)[^-]+-[^.]+" .env | head -1)-docker.pkg.dev" --quiet || \
-                gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
-
-              sudo docker compose pull
-              sudo docker compose up -d --remove-orphans
-              sudo docker image prune -f
-            '
+            --project "${{ secrets.GCP_PROJECT }}" --quiet \
+            --command "chmod +x ~/deploy-staging/rollout.sh && ~/deploy-staging/rollout.sh ${{ secrets.GCP_REGION }}-docker.pkg.dev"
 
       - name: Verify the container is healthy on the VM
         # Checked over SSH first so a DNS or certificate problem is reported as
