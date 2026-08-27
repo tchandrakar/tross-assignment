@@ -1,0 +1,60 @@
+# Runs on the GCE VM. Two containers:
+#   caddy — terminates TLS (automatic Let's Encrypt) and reverse-proxies
+#   api   — the profile API itself, never exposed directly to the internet
+#
+# The VM was chosen over a serverless runtime deliberately: this workload needs
+# a *stable egress IP* (LinkedIn correlates a session to the address it was
+# established from), a persistent volume for session state, and a warm browser
+# process. See README §Deployment.
+
+services:
+  api:
+    image: ${IMAGE}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      SESSION_IDENTITIES: ${SESSION_IDENTITIES:-primary}
+      GCS_BUCKET: ${GCS_BUCKET}
+      CACHE_ENABLED: ${CACHE_ENABLED:-true}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-604800}
+      SCRAPE_RATE_PER_MINUTE: ${SCRAPE_RATE_PER_MINUTE:-5}
+      ENABLE_BROWSER_FALLBACK: "true"
+      ENABLE_HTTP_TRANSPORT: "false"
+      API_KEYS: ${API_KEYS:-}
+      PROXY_URLS: ${PROXY_URLS:-}
+      PROXY_STICKY_TEMPLATE: ${PROXY_STICKY_TEMPLATE:-}
+    volumes:
+      # Local fallback for session state. GCS is authoritative when GCS_BUCKET
+      # is set; this keeps a warm copy across container restarts.
+      - session-state:/app/.sessions
+    # Chromium needs more than the default 64MB of shared memory.
+    shm_size: 1gb
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  session-state:
+  caddy-data:
+  caddy-config:

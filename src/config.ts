@@ -46,6 +46,14 @@ const envSchema = z.object({
   LI_EMAIL: z.string().default(''),
   LI_PASSWORD: z.string().default(''),
   IDENTITY_LABEL: z.string().default('primary'),
+  /**
+   * Comma-separated identity labels whose sessions live in the session store
+   * (established by `npm run login` and uploaded). This is the production
+   * form: no cookie, no password, nothing secret in the service config at all —
+   * the deployed service holds only a label, and the session itself lives in
+   * the blob store behind IAM.
+   */
+  SESSION_IDENTITIES: z.string().default(''),
 
   PROXY_URLS: z.string().default(''),
   PROXY_STICKY_TEMPLATE: z.string().default(''),
@@ -54,6 +62,12 @@ const envSchema = z.object({
   GCS_PREFIX: z.string().default('profiles/'),
   SESSION_STATE_DIR: z.string().default('.sessions'),
   CACHE_TTL_SECONDS: z.coerce.number().int().nonnegative().default(604800),
+  /**
+   * Set false to bypass the cache entirely — every request performs a live
+   * scrape (still subject to the scrape ceiling). Useful when developing the
+   * parsers, where a cached copy would mask whether a change actually worked.
+   */
+  CACHE_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
 
   SCRAPE_RATE_PER_MINUTE: z.coerce.number().int().positive().max(60).default(5),
   ENABLE_BROWSER_FALLBACK: z
@@ -121,9 +135,15 @@ function parseIdentities(env: z.infer<typeof envSchema>): IdentityConfig[] {
     ];
   }
 
-  // Credential-based setup: no cookie seed at all. The identity exists so the
-  // pool can hand it out; its session comes from the store, populated by the
-  // interactive login helper.
+  // Session-only identities: no cookie, no password. Their sessions come from
+  // the session store. This is how the deployed service is configured.
+  const sessionLabels = env.SESSION_IDENTITIES.split(',').map((v) => v.trim()).filter(Boolean);
+  if (sessionLabels.length > 0) {
+    return sessionLabels.map((label) => ({ label, liAt: '', jsessionId: '', cookies: jar }));
+  }
+
+  // Local credential-based setup: the identity exists so the pool can hand it
+  // out; its session comes from the store, populated by the login helper.
   if (env.LI_EMAIL.trim()) {
     return [{ label: env.IDENTITY_LABEL, liAt: '', jsessionId: '', cookies: jar }];
   }
@@ -165,6 +185,7 @@ function buildConfig() {
     gcsPrefix: env.GCS_PREFIX,
     sessionStateDir: env.SESSION_STATE_DIR,
     cacheTtlSeconds: env.CACHE_TTL_SECONDS,
+    cacheEnabled: env.CACHE_ENABLED,
 
     scrapeRatePerMinute: env.SCRAPE_RATE_PER_MINUTE,
     enableBrowserFallback: env.ENABLE_BROWSER_FALLBACK,

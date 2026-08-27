@@ -43,7 +43,7 @@ export class ProfileService {
     const startedAt = Date.now();
     const { publicId, refresh = false } = options;
 
-    if (!refresh) {
+    if (!refresh && this.config.cacheEnabled) {
       const cached = await this.readCache(publicId);
       if (cached) {
         return {
@@ -105,6 +105,20 @@ export class ProfileService {
     }
 
     const scrapedAt = new Date().toISOString();
+
+    if (!this.config.cacheEnabled) {
+      return {
+        data: result.profile,
+        meta: {
+          cached: false,
+          source: result.source,
+          scrapedAt,
+          ageSeconds: 0,
+          durationMs: Date.now() - startedAt,
+          missingSections: result.missingSections,
+        },
+      };
+    }
 
     try {
       await this.cache.set({

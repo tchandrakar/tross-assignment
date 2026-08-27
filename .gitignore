@@ -11,3 +11,5 @@ coverage/
 cookies.json
 secrets/
 .sessions/
+deploy/.env
+out/

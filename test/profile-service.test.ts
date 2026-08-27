@@ -8,7 +8,7 @@ import type { AppConfig } from '../src/config.js';
 import type { ProfileScraper } from '../src/linkedin/scraper.js';
 
 const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
-const config = { cacheTtlSeconds: 3600 } as AppConfig;
+const config = { cacheTtlSeconds: 3600, cacheEnabled: true } as AppConfig;
 
 const makeProfile = (publicId: string) =>
   profileSchema.parse({
@@ -157,5 +157,25 @@ describe('ProfileService', () => {
 
     await expect(service.getProfile({ publicId: 'ada', profileUrl: 'x' })).rejects.toThrow(ApiError);
     expect(limiter.status().remaining).toBe(1);
+  });
+
+  it('bypasses the cache entirely when caching is disabled', async () => {
+    const scraper = fakeScraper(async (id) => ok(id));
+    const cache = new MemoryProfileCache();
+    const service = new ProfileService(
+      scraper,
+      cache,
+      new ScrapeLimiter(5),
+      { ...config, cacheEnabled: false } as AppConfig,
+      logger,
+    );
+
+    await service.getProfile({ publicId: 'ada', profileUrl: 'x' });
+    const second = await service.getProfile({ publicId: 'ada', profileUrl: 'x' });
+
+    expect(second.meta.cached).toBe(false);
+    expect(scraper.scrape).toHaveBeenCalledTimes(2);
+    // Nothing was written, so a later cache-enabled read cannot find a stale copy.
+    expect(await cache.get('ada')).toBeNull();
   });
 });

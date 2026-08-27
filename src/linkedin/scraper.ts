@@ -4,12 +4,13 @@ import type { Identity, IdentityPool } from '../identity/pool.js';
 import type { Profile, ScrapeSource } from '../schema/profile.js';
 import { profileSchema } from '../schema/profile.js';
 import { VoyagerClient } from './voyager-client.js';
-import { normalize } from './normalize.js';
+import { normalize, resolveGraph } from './normalize.js';
 import type { BrowserSession } from '../browser/session.js';
 import {
-  dashProfileByVanityPath, profileCardsPath, profileNetworkInfoPath, profileViewPath, publicProfileUrl,
+  dashProfileByVanityPath, profileNetworkInfoPath, profileViewPath, publicProfileUrl,
 } from './endpoints.js';
 import { parseProfileView } from './parse/profile-view.js';
+import { parseDashProfile } from './parse/dash-profile.js';
 import {
   collectEntities, entityToCertification, entityToEducation, entityToExperience,
   entityToHonor, entityToLanguage, entityToProject, entityToPublication, entityToSkill,
@@ -169,78 +170,38 @@ export class ProfileScraper {
           }
           throw error;
         });
-      const { data: dashData, included } = normalize(body);
 
+      const { data, index, included } = normalize(body);
+
+      // The response is a Rest.li CollectionResponse whose single element is
+      // the Profile. Fall back to scanning `included` if the shape shifts.
       const record =
-        (pick(dashData, 'elements.0') as unknown) ??
-        included.find((e) => typeof e.$type === 'string' && (e.$type as string).endsWith('identity.profile.Profile'));
+        (pick(data, 'elements.0') as unknown) ??
+        (() => {
+          const raw = included.find(
+            (e) => typeof e.$type === 'string' && (e.$type as string).endsWith('identity.profile.Profile'),
+          );
+          return raw ? resolveGraph(raw, index) : undefined;
+        })();
 
       if (!isObject(record)) {
         throw new ApiError('PROFILE_NOT_FOUND', 'LinkedIn returned no profile record for that identifier.');
       }
 
-      const base = this.parseTopCard(record, publicId);
-      const sections = await this.fetchCards(publicId, identity, transport);
+      const { profile, missingSections } = parseDashProfile(record);
 
       return {
         source: transport.source,
-        missingSections: sections.missing,
-        profile: profileSchema.parse({ ...base, ...sections.parsed }),
+        missingSections,
+        profile: profileSchema.parse({
+          ...profile,
+          // Prefer LinkedIn's own identifier: it is authoritative if the caller
+          // used a stale vanity name that redirected.
+          publicId: str(pick(record, 'publicIdentifier')) ?? publicId,
+          profileUrl: publicProfileUrl(str(pick(record, 'publicIdentifier')) ?? publicId),
+        }),
       };
     });
-  }
-
-  private parseTopCard(record: Record<string, unknown>, publicId: string) {
-    const firstName = str(pick(record, 'firstName'));
-    const lastName = str(pick(record, 'lastName'));
-    const headline = str(pick(record, 'headline'));
-
-    return {
-      publicId,
-      profileUrl: publicProfileUrl(publicId),
-      urn: str(pick(record, 'entityUrn', 'dashEntityUrn')),
-      firstName,
-      lastName,
-      fullName: [firstName, lastName].filter(Boolean).join(' ') || null,
-      headline,
-      about: attributedText(pick(record, 'summary')) ?? str(pick(record, 'summary')),
-      location: {
-        full: str(pick(record, 'geoLocation.geo.defaultLocalizedName', 'geoLocationName', 'locationName')),
-        city: str(pick(record, 'geoLocation.geo.defaultLocalizedName'))?.split(',')[0]?.trim() ?? null,
-        country: str(pick(record, 'geoCountry.defaultLocalizedName', 'geoCountryName')),
-        countryCode: str(pick(record, 'location.countryCode'))?.toUpperCase()?.slice(0, 2) ?? null,
-      },
-      industry: str(pick(record, 'industry.name', 'industryName')),
-      pronouns: str(pick(record, 'standardizedPronoun', 'customPronoun')),
-      connectionCount: num(pick(record, 'connections.paging.total', 'connectionsCount')),
-      followerCount: num(pick(record, 'followingState.followerCount', 'followerCount')),
-      isPremium: pick(record, 'premium') === true,
-      isInfluencer: pick(record, 'influencer') === true,
-      isOpenToWork: get(record, 'profileOpenToWorkCard') != null || /open to work/i.test(headline ?? ''),
-      isHiring: /hiring/i.test(headline ?? ''),
-      profilePicture: parseVectorImage(pick(record, 'profilePicture.displayImageReference.vectorImage', 'profilePicture')),
-      backgroundImage: parseVectorImage(
-        pick(record, 'backgroundImage.displayImageReference.vectorImage', 'backgroundPicture', 'backgroundImage'),
-      ),
-    };
-  }
-
-  private async fetchCards(publicId: string, identity: Identity, transport: Transport) {
-    const empty = {
-      experience: [], education: [], skills: [], certifications: [],
-      languages: [], projects: [], publications: [], honors: [], volunteering: [],
-    };
-
-    let cards: unknown;
-    try {
-      cards = normalize(await transport.fetch(profileCardsPath(publicId), identity, publicId)).data;
-    } catch (error) {
-      if (error instanceof ApiError && (error.code === 'UPSTREAM_BLOCKED' || error.code === 'AUTH_FAILED')) throw error;
-      this.logger.warn({ err: error, publicId }, 'profile cards fetch failed; returning top-card data only');
-      return { parsed: empty, missing: Object.keys(empty) };
-    }
-
-    return parseCards(cards);
   }
 
   // ─── Legacy profileView ────────────────────────────────────────────────────

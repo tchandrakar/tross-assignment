@@ -1,0 +1,202 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: "Deploy without running tests (use only for hotfixes)"
+        type: boolean
+        default: false
+
+concurrency:
+  # Never let two deploys race onto the same VM.
+  group: deploy-vm
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: linkedin-profile-api
+  AR_REPO: containers
+
+jobs:
+  test:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_tests }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  build:
+    needs: [test]
+    # Still build when tests were deliberately skipped.
+    if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Artifact Registry auth
+        run: gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - id: meta
+        run: |
+          REG="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT }}/${AR_REPO}/${IMAGE_NAME}"
+          echo "image=${REG}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "latest=${REG}:latest" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.meta.outputs.latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Publish the LinkedIn session to the bucket
+        # The session is the one credential the running service needs. It lives
+        # in GCS behind IAM rather than on the VM disk, so a rebuilt VM comes
+        # back authenticated without a human re-running the login helper.
+        env:
+          SESSION_STATE: ${{ secrets.LI_SESSION_STATE }}
+        run: |
+          if [ -n "$SESSION_STATE" ]; then
+            printf '%s' "$SESSION_STATE" > /tmp/session.json
+            if ! python3 -c 'import json,sys; json.load(open("/tmp/session.json"))'; then
+              echo "::error::LI_SESSION_STATE is not valid JSON — refusing to publish it."
+              exit 1
+            fi
+            gcloud storage cp /tmp/session.json \
+              "gs://${{ secrets.GCS_BUCKET }}/sessions/${{ secrets.SESSION_IDENTITIES }}.json" --quiet
+            shred -u /tmp/session.json || rm -f /tmp/session.json
+            echo "session published"
+          else
+            echo "::warning::LI_SESSION_STATE is unset — the service will have no session until one is uploaded."
+          fi
+
+      - name: Render deployment files
+        run: |
+          mkdir -p out
+          cp deploy/docker-compose.yml deploy/Caddyfile out/
+          # Written on the runner, copied to the VM, never committed.
+          cat > out/.env <<ENVFILE
+          IMAGE=${{ needs.build.outputs.image }}
+          PUBLIC_HOST=${{ secrets.PUBLIC_HOST }}
+          PUBLIC_BASE_URL=https://${{ secrets.PUBLIC_HOST }}
+          GCS_BUCKET=${{ secrets.GCS_BUCKET }}
+          SESSION_IDENTITIES=${{ secrets.SESSION_IDENTITIES }}
+          LOG_LEVEL=info
+          CACHE_ENABLED=true
+          CACHE_TTL_SECONDS=604800
+          SCRAPE_RATE_PER_MINUTE=5
+          API_KEYS=${{ secrets.API_KEYS }}
+          PROXY_URLS=${{ secrets.PROXY_URLS }}
+          PROXY_STICKY_TEMPLATE=${{ secrets.PROXY_STICKY_TEMPLATE }}
+          ENVFILE
+
+      - name: Wait for the VM to accept SSH
+        run: |
+          for i in $(seq 1 20); do
+            if gcloud compute ssh "${{ secrets.GCP_VM }}" --zone "${{ secrets.GCP_ZONE }}" \
+                 --project "${{ secrets.GCP_PROJECT }}" --tunnel-through-iap=false \
+                 --command "true" --quiet 2>/dev/null; then
+              echo "ssh ready"; exit 0
+            fi
+            echo "waiting for ssh ($i/20)…"; sleep 15
+          done
+          echo "::error::VM never accepted SSH"; exit 1
+
+      - name: Copy deployment files to the VM
+        run: |
+          gcloud compute scp --recurse out/docker-compose.yml out/Caddyfile out/.env \
+            "${{ secrets.GCP_VM }}:~/deploy-staging/" \
+            --zone "${{ secrets.GCP_ZONE }}" --project "${{ secrets.GCP_PROJECT }}" --quiet
+
+      - name: Roll out
+        run: |
+          gcloud compute ssh "${{ secrets.GCP_VM }}" --zone "${{ secrets.GCP_ZONE }}" \
+            --project "${{ secrets.GCP_PROJECT }}" --quiet --command '
+              set -Eeuo pipefail
+              sudo mkdir -p /opt/linkedin-api
+              sudo mv ~/deploy-staging/* /opt/linkedin-api/
+              sudo chmod 600 /opt/linkedin-api/.env
+              cd /opt/linkedin-api
+
+              # The VM service account has Artifact Registry read via its
+              # cloud-platform scope; this wires docker up to use it.
+              gcloud auth configure-docker "$(grep -oP "(?<=IMAGE=)[^-]+-[^.]+" .env | head -1)-docker.pkg.dev" --quiet || \
+                gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
+
+              sudo docker compose pull
+              sudo docker compose up -d --remove-orphans
+              sudo docker image prune -f
+            '
+
+      - name: Verify the container is healthy on the VM
+        # Checked over SSH first so a DNS or certificate problem is reported as
+        # what it is, rather than as "the deploy failed".
+        run: |
+          for i in $(seq 1 20); do
+            if gcloud compute ssh "${{ secrets.GCP_VM }}" --zone "${{ secrets.GCP_ZONE }}" \
+                 --project "${{ secrets.GCP_PROJECT }}" --quiet \
+                 --command 'curl -sf --max-time 10 http://127.0.0.1:8080/healthz >/dev/null' 2>/dev/null; then
+              echo "container healthy on the VM"
+              gcloud compute ssh "${{ secrets.GCP_VM }}" --zone "${{ secrets.GCP_ZONE }}" \
+                --project "${{ secrets.GCP_PROJECT }}" --quiet \
+                --command 'curl -s --max-time 10 http://127.0.0.1:8080/health'
+              exit 0
+            fi
+            echo "container health $i/20…"; sleep 10
+          done
+          echo "::error::Container never became healthy"
+          gcloud compute ssh "${{ secrets.GCP_VM }}" --zone "${{ secrets.GCP_ZONE }}" \
+            --project "${{ secrets.GCP_PROJECT }}" --quiet \
+            --command 'cd /opt/linkedin-api && sudo docker compose logs --tail 100' || true
+          exit 1
+
+      - name: Verify the public HTTPS endpoint
+        # Non-fatal: TLS issuance needs the DNS record to point at the VM, and a
+        # freshly-pointed record can take a few minutes. The rollout itself has
+        # already been proven healthy above.
+        continue-on-error: true
+        run: |
+          for i in $(seq 1 18); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "https://${{ secrets.PUBLIC_HOST }}/healthz" || echo 000)
+            if [ "$CODE" = "200" ]; then
+              echo "public endpoint healthy: https://${{ secrets.PUBLIC_HOST }}"
+              curl -s "https://${{ secrets.PUBLIC_HOST }}/health" | head -c 600
+              exit 0
+            fi
+            echo "public check $i/18 -> $CODE"; sleep 10
+          done
+          echo "::warning::https://${{ secrets.PUBLIC_HOST }} not answering yet — check that its A record points to the VM."
