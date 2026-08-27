@@ -31,6 +31,10 @@
 # without it the deployment would be unverifiable in the meantime — you could
 # not tell "DNS not pointed yet" apart from "the service is broken". It serves
 # the same app; the canonical host above is the one to use.
-:80 {
+#
+# The `http://` scheme is load-bearing: with a bare `:80`, Caddy's automatic
+# HTTPS applies and answers every request with a 308 to https://<ip>, for which
+# no certificate can exist. An explicit scheme opts this block out.
+http:// {
 	import app
 }
