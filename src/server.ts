@@ -1,7 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
-import rateLimit from '@fastify/rate-limit';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import { timingSafeEqual } from 'node:crypto';
@@ -12,6 +11,7 @@ import { createCache } from './cache/index.js';
 import { IdentityPool } from './identity/pool.js';
 import { ProfileScraper } from './linkedin/scraper.js';
 import { ScrapeLimiter } from './ratelimit/scrape-limiter.js';
+import { KeyedSlidingWindowLimiter, SlidingWindowLimiter } from './ratelimit/sliding-window.js';
 import { ProfileService } from './service/profile-service.js';
 import { BrowserSession } from './browser/session.js';
 import { FileSessionStore, GcsSessionStore, type SessionStore } from './browser/session-store.js';
@@ -47,17 +47,12 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
   await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(cors, { origin: true, methods: ['GET', 'POST', 'DELETE', 'OPTIONS'] });
 
-  // Per-caller throttle. Distinct from the LinkedIn scrape ceiling: this one
-  // protects the service, that one protects the LinkedIn account.
-  await app.register(rateLimit, {
-    max: 60,
-    timeWindow: '1 minute',
-    allowList: (request) => request.url === '/healthz',
-  });
 
   const pool = new IdentityPool(config);
   const cache = createCache(config);
   const limiter = new ScrapeLimiter(config.scrapeRatePerMinute);
+  const globalLimiter = new SlidingWindowLimiter(config.globalRatePerMinute);
+  const clientLimiter = new KeyedSlidingWindowLimiter(config.clientRatePerMinute);
 
   // Persisted browser state is what lets us follow LinkedIn's li_at rotation
   // instead of replaying a stale token — see browser/session-store.ts.
@@ -77,6 +72,7 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
   const service = new ProfileService(scraper, cache, limiter, config, app.log);
 
   registerApiKeyAuth(app, config);
+  registerRateLimits(app, { globalLimiter, clientLimiter });
   registerErrorHandler(app);
 
   await app.register(swagger, {
@@ -85,7 +81,7 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
   });
   await app.register(swaggerUi, { routePrefix: '/docs', uiConfig: { docExpansion: 'list' } });
 
-  registerHealthRoutes(app, { pool, cache, limiter, startedAt, browserSession });
+  registerHealthRoutes(app, { pool, cache, limiter, globalLimiter, clientLimiter, startedAt, browserSession });
   registerProfileRoutes(app, service);
 
   if (!browserSession && !config.enableHttpTransport) {
@@ -110,6 +106,70 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
       await app.close();
     },
   };
+}
+
+/**
+ * Paths that must stay answerable even when the service is saturated.
+ *
+ * /health is included deliberately: it is the endpoint that reports remaining
+ * quota, so rate-limiting it makes it unavailable exactly when a caller most
+ * needs to know why they are being throttled.
+ */
+const UNLIMITED_PATHS = ['/healthz', '/health'];
+
+/**
+ * The two caller-facing rate limits. Both are separate from the LinkedIn scrape
+ * ceiling, and the separation is the point:
+ *
+ *   scrape ceiling  protects the LinkedIn account   (live fetches only)
+ *   global limit    protects this service            (every request)
+ *   per-client      keeps one caller from taking it all
+ *
+ * A cached response costs LinkedIn nothing, so it counts against the caller
+ * limits but never against the scrape ceiling.
+ *
+ * Checked per-client first: when a single caller is responsible for saturating
+ * the service, they should be the one told to slow down rather than everyone.
+ */
+function registerRateLimits(
+  app: FastifyInstance,
+  limits: { globalLimiter: SlidingWindowLimiter; clientLimiter: KeyedSlidingWindowLimiter },
+): void {
+  app.addHook('onRequest', async (request, reply) => {
+    if (UNLIMITED_PATHS.includes(request.url.split('?')[0] ?? '')) return;
+    if (request.method === 'OPTIONS') return;
+
+    const client = clientKey(request);
+
+    const perClient = limits.clientLimiter.tryAcquire(client);
+    if (!perClient.ok) {
+      reply.header('retry-after', String(perClient.retryAfterSeconds));
+      throw new ApiError('RATE_LIMITED', 'Too many requests from this client. Slow down and retry.', {
+        retryAfterSeconds: perClient.retryAfterSeconds,
+        details: { scope: 'client' },
+      });
+    }
+
+    const global = limits.globalLimiter.tryAcquire();
+    if (!global.ok) {
+      reply.header('retry-after', String(global.retryAfterSeconds));
+      throw new ApiError('RATE_LIMITED', 'The service is at its overall request limit. Retry shortly.', {
+        retryAfterSeconds: global.retryAfterSeconds,
+        details: { scope: 'service' },
+      });
+    }
+  });
+}
+
+/**
+ * Identifies a caller. An API key is the strongest signal available; otherwise
+ * the client address, which `trustProxy` resolves through X-Forwarded-For so
+ * every caller behind the reverse proxy is not treated as one client.
+ */
+function clientKey(request: { headers: Record<string, unknown>; ip: string }): string {
+  const provided = request.headers['x-api-key'];
+  const key = Array.isArray(provided) ? provided[0] : provided;
+  return typeof key === 'string' && key.length > 0 ? `key:${key.slice(0, 12)}` : `ip:${request.ip}`;
 }
 
 /**
@@ -160,14 +220,6 @@ function registerErrorHandler(app: FastifyInstance): void {
       const log = error.statusCode >= 500 ? request.log.error : request.log.warn;
       log.call(request.log, { err: error, code: error.code }, 'request failed');
       return reply.status(error.statusCode).send(error.toJSON());
-    }
-
-    // @fastify/rate-limit surfaces its own 429.
-    if ((error as { statusCode?: number }).statusCode === 429) {
-      return reply.status(429).send({
-        success: false,
-        error: { code: 'RATE_LIMITED', message: 'Too many requests to this API. Slow down and retry.' },
-      });
     }
 
     if ((error as { statusCode?: number }).statusCode === 400) {

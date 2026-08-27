@@ -126,6 +126,8 @@ jobs:
           CACHE_ENABLED=true
           CACHE_TTL_SECONDS=604800
           SCRAPE_RATE_PER_MINUTE=5
+          CLIENT_RATE_PER_MINUTE=10
+          GLOBAL_RATE_PER_MINUTE=20
           API_KEYS=${{ secrets.API_KEYS }}
           PROXY_URLS=${{ secrets.PROXY_URLS }}
           PROXY_STICKY_TEMPLATE=${{ secrets.PROXY_STICKY_TEMPLATE }}

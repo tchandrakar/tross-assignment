@@ -3,6 +3,7 @@ import type { ProfileCache } from '../cache/index.js';
 import type { IdentityPool } from '../identity/pool.js';
 import type { ScrapeLimiter } from '../ratelimit/scrape-limiter.js';
 import type { BrowserSession } from '../browser/session.js';
+import type { KeyedSlidingWindowLimiter, SlidingWindowLimiter } from '../ratelimit/sliding-window.js';
 
 /**
  * Health is deliberately unauthenticated but leaks nothing sensitive: identity
@@ -14,6 +15,8 @@ export function registerHealthRoutes(
     pool: IdentityPool;
     cache: ProfileCache;
     limiter: ScrapeLimiter;
+    globalLimiter: SlidingWindowLimiter;
+    clientLimiter: KeyedSlidingWindowLimiter;
     startedAt: number;
     browserSession: BrowserSession | null;
   },
@@ -24,6 +27,7 @@ export function registerHealthRoutes(
     const anyIdentityUsable = identities.some((i) => i.state === 'available');
 
     const budget = deps.limiter.status();
+    const global = deps.globalLimiter.status();
 
     return {
       status: anyIdentityUsable && cacheHealthy ? 'ok' : 'degraded',
@@ -31,6 +35,14 @@ export function registerHealthRoutes(
       // Promoted to the top level: "how many scrapes do I have left right now"
       // is the question this endpoint is most often asked.
       requestsRemaining: budget.remaining,
+      rateLimits: {
+        // New profiles fetched from LinkedIn. Cache hits do not consume this.
+        scrapesPerMinute: budget,
+        // Every request, service-wide.
+        requestsPerMinute: global,
+        // Per caller, applied before the service-wide limit.
+        perClientPerMinute: { limitPerMinute: deps.clientLimiter.limitPerMinute, activeClients: deps.clientLimiter.activeKeys },
+      },
       scrapeBudget: budget,
       cache: { kind: deps.cache.kind, healthy: cacheHealthy },
       // A session that is open and recently touched is one that will not need

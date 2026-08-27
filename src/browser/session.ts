@@ -48,6 +48,12 @@ const UA =
  */
 const KEEPALIVE_INTERVAL_MS = 8 * 60_000;
 
+/** Consecutive automatic-login failures before the service stops trying. */
+const MAX_LOGIN_FAILURES = 3;
+
+/** How long automatic login stays suspended after tripping the breaker. */
+const LOGIN_BLOCK_MS = 30 * 60_000;
+
 /**
  * Runs in the page. Confirms the session against the API rather than the DOM —
  * LinkedIn serves a guest-rendered page to an unauthenticated navigation while
@@ -96,6 +102,15 @@ export class BrowserSession {
   private readonly sessions = new Map<string, LiveSession>();
   private readonly opening = new Map<string, Promise<LiveSession>>();
   private readonly logins = new Map<string, Promise<StorageState>>();
+  /**
+   * Circuit breaker on automatic login.
+   *
+   * Repeated failed logins are how an account gets locked, and the most common
+   * cause of failure is a credential that is simply wrong — retrying that can
+   * only make things worse. After a small number of consecutive failures the
+   * service stops trying and reports what a human needs to do.
+   */
+  private readonly loginFailures = new Map<string, { count: number; lastError: string; blockedUntil: number }>();
   private closed = false;
 
   constructor(
@@ -315,6 +330,18 @@ export class BrowserSession {
       );
     }
 
+    const failures = this.loginFailures.get(identity.id);
+    if (failures && failures.count >= MAX_LOGIN_FAILURES && Date.now() < failures.blockedUntil) {
+      const minutes = Math.ceil((failures.blockedUntil - Date.now()) / 60_000);
+      throw new ApiError(
+        'AUTH_FAILED',
+        `Automatic login for identity "${identity.label}" is suspended after ${failures.count} consecutive failures ` +
+          `(last: ${failures.lastError}). Retrying a rejected credential risks locking the account. ` +
+          `Fix LI_EMAIL / LI_PASSWORD, or run \`npm run login\` and upload the session. Retrying in ~${minutes}m.`,
+        { details: { identity: identity.label, consecutiveFailures: failures.count, needsHuman: true } },
+      );
+    }
+
     const attempt = (async () => {
       this.logger.info({ identity: identity.label }, 'no usable session — attempting automatic login');
 
@@ -328,6 +355,7 @@ export class BrowserSession {
       });
 
       await this.store.save(identity.id, state as StorageState);
+      this.loginFailures.delete(identity.id);
       this.logger.info({ identity: identity.label, account: firstName }, 'automatic login succeeded; session stored');
       return state as StorageState;
     })().finally(() => this.logins.delete(identity.id));
@@ -337,6 +365,38 @@ export class BrowserSession {
     try {
       return await attempt;
     } catch (error) {
+      const message = (error as Error).message ?? String(error);
+      const previous = this.loginFailures.get(identity.id)?.count ?? 0;
+      const count = previous + 1;
+      this.loginFailures.set(identity.id, {
+        count,
+        lastError: message.slice(0, 200),
+        blockedUntil: Date.now() + LOGIN_BLOCK_MS,
+      });
+      this.logger.error(
+        { identity: identity.label, consecutiveFailures: count },
+        count >= MAX_LOGIN_FAILURES
+          ? 'automatic login suspended after repeated failures — a human needs to intervene'
+          : 'automatic login failed',
+      );
+
+      // "Wrong email or password" is terminal: no amount of retrying fixes a
+      // credential that is simply incorrect, and each attempt is a step towards
+      // a locked account.
+      if (/wrong email or password|incorrect|couldn.t find|not the right password/i.test(message)) {
+        this.loginFailures.set(identity.id, {
+          count: MAX_LOGIN_FAILURES,
+          lastError: 'LinkedIn rejected the credentials',
+          blockedUntil: Date.now() + LOGIN_BLOCK_MS,
+        });
+        throw new ApiError(
+          'AUTH_FAILED',
+          `LinkedIn rejected the credentials for identity "${identity.label}". ` +
+            'Automatic login is suspended — check LI_EMAIL / LI_PASSWORD, or run `npm run login` and upload the session.',
+          { cause: error, details: { identity: identity.label, needsHuman: true, credentialsRejected: true } },
+        );
+      }
+
       if (error instanceof LoginChallengeError) {
         throw new ApiError('AUTH_FAILED', error.message, {
           cause: error,

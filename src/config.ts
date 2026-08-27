@@ -76,7 +76,12 @@ const envSchema = z.object({
    */
   CACHE_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
 
+  /** Tier 1 — new profiles fetched from LinkedIn per minute, service-wide. */
   SCRAPE_RATE_PER_MINUTE: z.coerce.number().int().positive().max(60).default(5),
+  /** Tier 2 — requests per minute from a single caller (API key, else client address). */
+  CLIENT_RATE_PER_MINUTE: z.coerce.number().int().positive().max(600).default(10),
+  /** Tier 3 — total requests per minute across the whole service. */
+  GLOBAL_RATE_PER_MINUTE: z.coerce.number().int().positive().max(6000).default(20),
   ENABLE_BROWSER_FALLBACK: z
     .enum(['true', 'false'])
     .default('true')
@@ -196,6 +201,8 @@ function buildConfig() {
     cacheEnabled: env.CACHE_ENABLED,
 
     scrapeRatePerMinute: env.SCRAPE_RATE_PER_MINUTE,
+    clientRatePerMinute: env.CLIENT_RATE_PER_MINUTE,
+    globalRatePerMinute: env.GLOBAL_RATE_PER_MINUTE,
     enableBrowserFallback: env.ENABLE_BROWSER_FALLBACK,
     enableHttpTransport: env.ENABLE_HTTP_TRANSPORT,
   } as const;

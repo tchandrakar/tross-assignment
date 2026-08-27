@@ -1,140 +1,51 @@
 # LinkedIn Profile API
 
-A hosted HTTPS API that accepts a LinkedIn profile URL and returns the profile as structured JSON — name, headline, location, about, experience, education, skills, certifications, languages, images and more.
+An HTTPS service that accepts a LinkedIn profile URL and returns the profile as structured JSON — name, headline, location, summary, positions, education, skills, certifications, languages and media.
 
-Data is read from LinkedIn's internal **Voyager API** (the same endpoints linkedin.com's own single-page app calls), not by parsing rendered HTML.
+Data is read from LinkedIn's internal **Voyager API** — the same endpoints linkedin.com's own single-page application calls — rather than by parsing rendered HTML.
 
 ```bash
-curl "https://<host>/v1/profile?url=https://www.linkedin.com/in/williamhgates/"
+curl -s --get \
+  --data-urlencode "url=https://www.linkedin.com/in/williamhgates/" \
+  https://linkedin.viral-engine.ai/v1/profile
 ```
 
-**Live:** `<DEPLOYED_URL>` · **Interactive docs:** `<DEPLOYED_URL>/docs` · **Health:** `<DEPLOYED_URL>/health`
+| | |
+|---|---|
+| **Base URL** | `https://linkedin.viral-engine.ai` |
+| **Interactive docs** | [`/docs`](https://linkedin.viral-engine.ai/docs) · OpenAPI 3.0 at [`/docs/json`](https://linkedin.viral-engine.ai/docs/json) |
+| **Health** | [`/health`](https://linkedin.viral-engine.ai/health) |
+| **Source** | [github.com/tchandrakar/tross-assignment](https://github.com/tchandrakar/tross-assignment) |
 
 ---
 
 ## Contents
 
-- [Quick start](#quick-start)
-- [Configuration](#configuration)
-- [API documentation](#api-documentation)
-- [Approach](#approach)
+- [API contract](#api-contract)
+- [Rate limits](#rate-limits)
+- [How it works](#how-it-works)
 - [Design decisions](#design-decisions)
+- [Running it yourself](#running-it-yourself)
 - [Deployment](#deployment)
 - [Known limitations](#known-limitations)
-- [Legal](#legal)
+- [Legal and compliance](#legal-and-compliance)
+- [Project layout](#project-layout)
 
 ---
 
-## Quick start
+## API contract
 
-**Requirements:** Node.js ≥ 20 (developed on 25), and a LinkedIn account you're willing to use.
-
-```bash
-git clone https://github.com/tchandrakar/tross-assignment.git
-cd tross-assignment
-npm install
-npx playwright install chromium
-cp .env.example .env
-```
-
-### Establishing a session
-
-Put your account's credentials in `.env` and run the login helper:
-
-```bash
-npm run login
-```
-
-A **visible** browser opens, logs in with human-paced typing, pauses if LinkedIn
-presents a CAPTCHA or emails you a code (clear it in the window), verifies the
-result against `/voyager/api/me`, and writes the session to `.sessions/`.
-
-Then start the API:
-
-```bash
-npm run dev
-```
-
-`http://localhost:8080`, docs at `/docs`.
-
-Once the session file exists you can delete `LI_PASSWORD` from `.env` — **the
-server never reads it.** Credentials are used only by the login helper, only to
-fill LinkedIn's own form, and are never logged or written to disk.
-
-> `.sessions/*.json` is a live logged-in session. It is gitignored and written
-> mode `0600`. Treat it exactly like a password.
-
-#### Why login rather than pasting a cookie
-
-The obvious approach — copy `li_at` out of DevTools and use it forever — does
-not work, and fails in a way that looks like something else.
-
-**LinkedIn rotates `li_at` on use and invalidates the previous value.** A pasted
-cookie is a point-in-time snapshot that goes stale within minutes. Replaying a
-superseded token is the signature of a stolen cookie, and LinkedIn responds by
-killing the session server-side:
-
-```http
-HTTP/2 302
-location: https://www.linkedin.com/voyager/api/me
-set-cookie: li_at=delete me; Expires=Thu, 01-Jan-1970 00:00:00 GMT; Max-Age=0
-```
-
-That is not a rate limit and not an expiry — the cookie is unrecoverable, and
-re-copying from the same browser session cannot produce a live one. Observed
-directly during development: a freshly-pasted jar authenticated successfully and
-then returned `401` about a minute later from a new browser context, because the
-first request had already rotated the token and the new value was discarded with
-the context.
-
-So the fix is *persistence*, not better headers. The API stores the browser's
-storage state after every call and reloads it on the next one, following the
-rotation instead of fighting it. Cookie pasting is still supported via
-`LI_COOKIES` — it just acts as a one-time bootstrap seed rather than a
-permanent credential.
-
-```bash
-npm test          # 100 unit tests, no network access required
-npm run typecheck # strict tsc
-npm run build     # compile to dist/
-```
-
----
-
-## Configuration
-
-Every option is in [`.env.example`](.env.example). The ones that matter:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `LI_EMAIL` / `LI_PASSWORD` | — | Used **only** by `npm run login`. The server never reads them. |
-| `IDENTITY_LABEL` | `primary` | Names the identity, and keys its stored session. |
-| `SESSION_STATE_DIR` | `.sessions` | Where browser session state is persisted locally. |
-| `LI_COOKIES` | — | A pasted `cookie:` header, used as a one-time bootstrap seed. |
-| `LINKEDIN_IDENTITIES` | — | JSON array of `{label, liAt, jsessionId, cookies?, proxy?}` for multi-account setups. |
-| `ENABLE_BROWSER_FALLBACK` | `true` | The browser transport. Leave on. |
-| `ENABLE_HTTP_TRANSPORT` | `false` | Raw-HTTP Voyager. Off by default — it burns sessions (see [Approach](#approach)). |
-| `PROXY_URLS` | — | Comma-separated proxy URLs, assigned round-robin to identities. |
-| `PROXY_STICKY_TEMPLATE` | — | Proxy URL template with `{session}` for sticky-session providers. |
-| `GCS_BUCKET` | — | Blob bucket for the profile cache *and* session state. In-process LRU when unset. |
-| `CACHE_TTL_SECONDS` | `604800` (7d) | How long a cached profile is served before re-scraping. `0` = never expire. |
-| `SCRAPE_RATE_PER_MINUTE` | `5` | **Hard ceiling** on live LinkedIn fetches. |
-| `API_KEYS` | — | Comma-separated keys required as `x-api-key`. Unauthenticated when empty. |
-
----
-
-## API documentation
-
-Interactive OpenAPI docs are served at **`/docs`**, and the raw spec at **`/docs/json`**. The spec is generated from the same Zod schemas the code validates against, so it cannot drift from the implementation.
+All responses are `application/json`. Every response carries a boolean `success`
+discriminator, so a client can branch on one field before reading anything else.
 
 ### `GET /v1/profile`
 
-| Parameter | In | Required | Description |
-|---|---|---|---|
-| `url` | query | yes | A LinkedIn profile URL, or a bare vanity name. |
-| `refresh` | query | no | `true` bypasses the cache and forces a live scrape. |
+| Parameter | In | Required | Type | Description |
+|---|---|---|---|---|
+| `url` | query | yes | string | A LinkedIn profile URL, or a bare vanity name |
+| `refresh` | query | no | boolean | Bypass the cache and force a live fetch. Defaults to `false` |
 
-All of these resolve to the same profile:
+Accepted input forms — all resolve to the same profile:
 
 ```
 https://www.linkedin.com/in/williamhgates/
@@ -144,7 +55,8 @@ www.linkedin.com/in/williamhgates/en
 williamhgates
 ```
 
-`/company/…` and `/school/…` URLs are rejected with `400` rather than silently misinterpreted.
+`/company/…` and `/school/…` URLs are rejected with `400` rather than
+misinterpreted as member profiles.
 
 ### `POST /v1/profile`
 
@@ -152,19 +64,33 @@ williamhgates
 { "url": "https://www.linkedin.com/in/williamhgates/", "refresh": false }
 ```
 
+Identical semantics to `GET`; provided for clients that prefer not to place
+identifiers in query strings.
+
 ### `DELETE /v1/profile/{publicId}/cache`
 
-Evicts one cached profile. Returns `{ "success": true, "evicted": true|false }`.
+Evicts a single cached profile. Returns `{ "success": true, "publicId": "…", "evicted": true }`.
 
 ### `GET /health`
 
-Unauthenticated. Reports identity-pool state, cache reachability and remaining scrape budget — without exposing cookies or proxy credentials.
+Service status, dependency health, and remaining quota across all three rate
+limit tiers. Never rate limited — the endpoint that reports remaining quota must
+stay reachable precisely when a caller is being throttled.
 
 ### `GET /healthz`
 
-Liveness only. Deliberately touches no dependency, so an upstream block can never cause the platform to recycle a healthy container.
+Liveness only. Touches no dependency, so an upstream problem cannot cause the
+platform to recycle an otherwise healthy container.
 
-### Response
+### Response headers
+
+| Header | Values | Meaning |
+|---|---|---|
+| `x-cache` | `HIT` \| `MISS` | Whether the response came from the cache |
+| `x-source` | see `meta.source` | Which extraction path produced the data |
+| `retry-after` | seconds | Present on every `429` and on `503` where a wait is known |
+
+### Success response
 
 ```jsonc
 {
@@ -172,13 +98,13 @@ Liveness only. Deliberately touches no dependency, so an upstream block can neve
   "data": {
     "publicId": "williamhgates",
     "profileUrl": "https://www.linkedin.com/in/williamhgates/",
-    "urn": "urn:li:fs_profile:ACoAAA8BYqEB...",
+    "urn": "urn:li:fsd_profile:ACoAAA8BYqEB…",
 
     "firstName": "Bill",
     "lastName": "Gates",
     "fullName": "Bill Gates",
-    "headline": "Co-chair, Bill & Melinda Gates Foundation",
-    "about": "Co-chair of the Bill & Melinda Gates Foundation…",
+    "headline": "Chair, Gates Foundation and Founder, Breakthrough Energy",
+    "about": "Chair of the Gates Foundation. Founder of Breakthrough Energy…",
     "location": {
       "full": "Seattle, Washington, United States",
       "city": "Seattle",
@@ -188,32 +114,33 @@ Liveness only. Deliberately touches no dependency, so an upstream block can neve
     "industry": "Philanthropy",
     "pronouns": null,
 
-    "connectionCount": 500,
-    "followerCount": 36000000,
+    "connectionCount": null,
+    "followerCount": null,
     "isPremium": true,
     "isInfluencer": true,
     "isOpenToWork": false,
     "isHiring": false,
 
     "profilePicture": {
-      "url": "https://media.licdn.com/dms/image/…/profile.jpg",
-      "width": 800, "height": 800,
-      "expiresAt": "2026-09-24T00:00:00.000Z"
+      "url": "https://media.licdn.com/dms/image/v2/…/profile-displayphoto-shrink_800_800/…",
+      "width": 800,
+      "height": 800,
+      "expiresAt": "2026-09-17T00:00:00.000Z"
     },
-    "backgroundImage": { "…": "same shape" },
+    "backgroundImage": { "url": "…", "width": 1584, "height": 396, "expiresAt": "…" },
 
     "experience": [
       {
         "title": "Co-chair",
-        "employmentType": "Full time",
-        "company": "Bill & Melinda Gates Foundation",
-        "companyLinkedinUrl": "https://www.linkedin.com/company/bill-&-melinda-gates-foundation/",
+        "employmentType": null,
+        "company": "Gates Foundation",
+        "companyLinkedinUrl": "https://www.linkedin.com/company/gates-foundation/",
         "companyLogo": { "url": "…", "width": 200, "height": 200, "expiresAt": "…" },
-        "location": "Seattle, Washington",
-        "workplaceType": "On-site",
-        "description": "…",
+        "location": null,
+        "workplaceType": null,
+        "description": null,
         "dates": {
-          "start": { "day": null, "month": 1, "year": 2000 },
+          "start": { "day": null, "month": null, "year": 2000 },
           "end": null,
           "current": true,
           "durationMonths": 319
@@ -221,86 +148,201 @@ Liveness only. Deliberately touches no dependency, so an upstream block can neve
         "skills": []
       }
     ],
-    "education":      [ { "school": "…", "degree": "…", "fieldOfStudy": "…", "grade": null,
-                          "activities": null, "description": null, "schoolLinkedinUrl": "…",
-                          "schoolLogo": { "…": "" }, "dates": { "…": "" } } ],
-    "skills":         [ { "name": "Philanthropy", "endorsementCount": 42 } ],
-    "certifications": [ { "name": "…", "issuer": "…", "issuerLogo": null, "issuedAt": { "…": "" },
-                          "expiresAt": null, "credentialId": "…", "credentialUrl": "…" } ],
-    "languages":      [ { "name": "English", "proficiency": "Native or bilingual proficiency" } ],
-    "projects":       [], "publications": [], "honors": [], "volunteering": []
+
+    "education": [
+      {
+        "school": "Harvard University",
+        "schoolLinkedinUrl": "https://www.linkedin.com/school/harvard-university/",
+        "schoolLogo": { "url": "…", "width": 200, "height": 200, "expiresAt": "…" },
+        "degree": null,
+        "fieldOfStudy": null,
+        "grade": null,
+        "activities": null,
+        "description": null,
+        "dates": {
+          "start": { "day": null, "month": null, "year": 1973 },
+          "end":   { "day": null, "month": null, "year": 1975 },
+          "current": false,
+          "durationMonths": 35
+        }
+      }
+    ],
+
+    "skills":         [ { "name": "Digital Marketing", "endorsementCount": null } ],
+    "certifications": [ {
+      "name": "HubSpot Sales Hub Certification",
+      "issuer": "HubSpot",
+      "issuerLogo": { "url": "…", "width": 200, "height": 200, "expiresAt": "…" },
+      "issuedAt": { "day": null, "month": 4, "year": 2023 },
+      "expiresAt": null,
+      "credentialId": null,
+      "credentialUrl": "https://app.hubspot.com/academy/achievements/…"
+    } ],
+    "languages":      [ { "name": "English", "proficiency": "Full professional proficiency" } ],
+    "projects":       [],
+    "publications":   [],
+    "honors":         [ { "title": "Employee of the Month", "issuer": "…", "description": "…", "issuedAt": { "day": null, "month": 8, "year": 2014 } } ],
+    "volunteering":   []
   },
+
   "meta": {
     "cached": false,
-    "source": "voyager-profile-view",
-    "scrapedAt": "2026-08-27T01:42:11.238Z",
+    "source": "browser-voyager",
+    "scrapedAt": "2026-08-27T04:12:44.201Z",
     "ageSeconds": 0,
-    "durationMs": 1284,
-    "missingSections": ["publication", "honor"]
+    "durationMs": 6989,
+    "missingSections": ["projects", "publications", "volunteering"]
   }
 }
 ```
 
-Two response-header shortcuts: `x-cache: HIT|MISS` and `x-source`.
+### Schema conventions
 
-#### Schema conventions
+These hold everywhere in the response, and each exists for a reason:
 
-These are deliberate, and consistent throughout:
+- **`null` means "we looked and LinkedIn did not have it."** Every array is
+  always present, possibly empty, so a client never has to branch on
+  `undefined` before iterating.
+- **Dates are structured, not formatted.** LinkedIn stores month + year for most
+  entries and sometimes only a year. `{ day, month, year }` with nullable parts
+  reports exactly the precision that exists; a pre-formatted `"Jan 2020"` would
+  destroy information and impose one locale on every consumer.
+- **`durationMonths` is computed, not copied.** LinkedIn renders tenure as
+  display text; a number is what callers actually want to sort and aggregate on.
+- **No LinkedIn vocabulary in the contract.** No `com.linkedin.voyager.*` type
+  names, no `$recipeType`, no URNs in required fields. `urn` is exposed because
+  it is genuinely useful — it remains stable when a member changes their vanity
+  name — but nothing else depends on it.
+- **Enumerations are humanised.** `FULL_TIME` becomes `"Full time"`;
+  `NATIVE_OR_BILINGUAL` becomes `"Native or bilingual proficiency"`.
+- **`meta.missingSections` distinguishes "empty" from "not retrieved."** An
+  empty `certifications` array could mean the member has none, or that the
+  section could not be read. This field tells you which, so a consumer never
+  silently records an absence that was really a failure.
 
-- **`null` means "we looked and LinkedIn didn't have it."** Arrays are always present, possibly empty — a caller never has to branch on `undefined`.
-- **Dates are structured, not formatted.** LinkedIn genuinely only stores month + year for most entries (and sometimes only a year), so `{ day, month, year }` with nullable parts reports exactly the precision that exists. Formatting is the caller's business, and a pre-formatted `"Jan 2020"` would destroy information.
-- **No LinkedIn vocabulary in the contract.** No URNs in required fields, no `com.linkedin.voyager.*` type names, no `$recipeType` leakage. `urn` is exposed because it's genuinely useful — it's stable even when a member changes their vanity name — but nothing depends on it.
-- **`meta.missingSections` distinguishes "empty" from "failed."** An empty `certifications` array could mean the member has none, or that the certifications card failed to load. `missingSections` tells you which.
-- **Enums are humanised.** `FULL_TIME` → `"Full time"`, `NATIVE_OR_BILINGUAL` → `"Native or bilingual proficiency"`.
-
-### Errors
+### Error response
 
 ```json
-{ "success": false, "error": { "code": "SCRAPE_THROTTLED", "message": "…", "retryAfterSeconds": 47 } }
+{
+  "success": false,
+  "error": {
+    "code": "SCRAPE_THROTTLED",
+    "message": "Live scrape budget exhausted: at most 5 new profiles are fetched from LinkedIn per minute. Already-scraped profiles are still served instantly from cache.",
+    "details": { "limitPerMinute": 5 },
+    "retryAfterSeconds": 47
+  }
+}
 ```
 
-| Code | HTTP | Meaning |
-|---|---|---|
-| `INVALID_URL` | 400 | Not a parseable LinkedIn member profile URL. |
-| `UNAUTHORIZED` | 401 | Missing or invalid `x-api-key`. |
-| `PROFILE_PRIVATE` | 403 | The profile exists but isn't visible to the configured session. |
-| `PROFILE_NOT_FOUND` | 404 | No profile at that identifier. |
-| `RATE_LIMITED` | 429 | Per-caller API rate limit (60/min). |
-| `SCRAPE_THROTTLED` | 429 | Live-scrape budget exhausted. **Cached profiles still resolve.** |
-| `AUTH_FAILED` | 502 | LinkedIn rejected the session cookie — it has expired. |
-| `PARSE_FAILED` | 502 | Every extraction strategy ran but none produced a profile. |
-| `UPSTREAM_BLOCKED` | 503 | LinkedIn flagged the request as automated. |
-| `NO_IDENTITY_AVAILABLE` | 503 | All identities are cooling down or quarantined. |
-
-`429` and `503` responses carry a `retry-after` header wherever a wait time is known.
+| Code | HTTP | Meaning | Client action |
+|---|---|---|---|
+| `INVALID_URL` | 400 | Not a parseable LinkedIn member profile URL | Fix the input |
+| `UNAUTHORIZED` | 401 | Missing or invalid `x-api-key` | Supply a valid key |
+| `PROFILE_PRIVATE` | 403 | Profile exists but is not visible to the service's account | Not retryable |
+| `PROFILE_NOT_FOUND` | 404 | No profile at that identifier | Not retryable |
+| `RATE_LIMITED` | 429 | Caller or service request limit reached | Retry after `retryAfterSeconds` |
+| `SCRAPE_THROTTLED` | 429 | Live-fetch budget exhausted. **Cached profiles still resolve** | Retry, or request a cached profile |
+| `AUTH_FAILED` | 502 | The upstream session is no longer valid | Operator action; see `details.needsHuman` |
+| `PARSE_FAILED` | 502 | Every extraction strategy ran but none produced a profile | Retry once, then report |
+| `ENDPOINT_RETIRED` | 502 | LinkedIn has withdrawn an endpoint | Operator action |
+| `UPSTREAM_BLOCKED` | 503 | LinkedIn rejected the request | Retry after `retryAfterSeconds` |
+| `NO_IDENTITY_AVAILABLE` | 503 | All upstream identities are cooling down or quarantined | Retry later |
 
 ---
 
-## Approach
+## Rate limits
 
-### 1. Voyager, not HTML
+Three independent tiers. They are separate because they protect different
+things, and conflating them would throttle traffic that carries no risk.
 
-linkedin.com is a single-page app. The rendered DOM is a lossy projection of JSON the browser already fetched, and its class names are minified and rotate on every deploy — so a DOM scraper is both less complete and more brittle than reading the API underneath it.
+| Tier | Limit | Scope | Counts | Purpose |
+|---|---|---|---|---|
+| **New profile fetches** | 5 / min | Service-wide | Live LinkedIn fetches only | Protects the upstream account |
+| **Per caller** | 10 / min | Per API key, else client IP | All requests | Stops one caller consuming the service |
+| **Service total** | 20 / min | All callers combined | All requests | Bounds total load |
 
-That API is **Voyager**, at `https://www.linkedin.com/voyager/api/…`. It's authenticated purely by cookie:
+**A cache hit costs the upstream nothing, so it never consumes the fetch
+budget.** A caller can therefore retrieve already-known profiles at the full
+10/min even while the fetch budget is exhausted.
+
+The per-caller limit is evaluated first: when one caller is responsible for
+saturating the service, that caller should be the one told to slow down rather
+than everyone else.
+
+All three are **sliding windows**, not token buckets. A bucket refills
+continuously and therefore admits close to a 2× burst across a window boundary —
+N requests at the end of one window and N more at the start of the next. A
+sliding window makes "no more than N in *any* 60 seconds" literally true, which
+is the guarantee the upstream limit actually needs.
+
+Current quota is always readable:
+
+```bash
+curl -s https://linkedin.viral-engine.ai/health | jq .rateLimits
+```
+
+```json
+{
+  "scrapesPerMinute":   { "limitPerMinute": 5,  "usedInWindow": 0,  "remaining": 5,  "resetInSeconds": 0 },
+  "requestsPerMinute":  { "limitPerMinute": 20, "usedInWindow": 10, "remaining": 10, "resetInSeconds": 60 },
+  "perClientPerMinute": { "limitPerMinute": 10, "activeClients": 1 }
+}
+```
+
+---
+
+## How it works
+
+### Voyager, not HTML
+
+linkedin.com is a single-page application. Its rendered DOM is a lossy
+projection of JSON the browser has already fetched, and its class names are
+minified and change on every deploy. A DOM scraper is therefore both less
+complete and more brittle than reading the API underneath it.
+
+That API is **Voyager**, at `https://www.linkedin.com/voyager/api/…`,
+authenticated purely by cookie:
 
 ```http
-GET /voyager/api/identity/profiles/williamhgates/profileView
+GET /voyager/api/identity/dash/profiles?q=memberIdentity&memberIdentity=williamhgates
+    &decorationId=com.linkedin.voyager.dash.deco.identity.profile.FullProfileWithEntities-102
 Cookie: li_at=<session>; JSESSIONID="ajax:1234567890123456789"
-csrf-token: ajax:1234567890123456789        ← the JSESSIONID value, unquoted
+csrf-token: ajax:1234567890123456789
 x-restli-protocol-version: 2.0.0
 accept: application/vnd.linkedin.normalized+json+2.1
 ```
 
-Three details are load-bearing, and each one is a silent failure if you get it wrong:
+Three details are load-bearing, and each fails silently rather than loudly if
+you get it wrong:
 
-- **`csrf-token` is literally the `JSESSIONID` value with the quotes stripped.** Not derived from it — the same string. Send it quoted and every request 403s.
-- **`x-restli-protocol-version: 2.0.0`** switches Rest.li into its compact encoding. Omit it and array/URN parameters are parsed differently, producing empty results rather than errors.
-- **The `normalized+json` Accept header** is what makes LinkedIn flatten the object graph (below). Without it you get a deeply nested response with a different shape entirely.
+- **`csrf-token` is the `JSESSIONID` value with the quotes stripped** — the same
+  string, not something derived from it. Send it quoted and every request 403s.
+- **`x-restli-protocol-version: 2.0.0`** selects Rest.li's compact encoding.
+  Omit it and array and URN parameters are interpreted differently, producing
+  empty results rather than errors.
+- **The `normalized+json` Accept header** is what makes LinkedIn flatten the
+  object graph. Without it the response has an entirely different shape.
 
-### 2. Rehydrating the normalized graph
+### One request returns the whole profile
 
-With that Accept header, Voyager doesn't nest objects — it returns a flattened graph:
+The `FullProfileWithEntities-102` decoration returns the **entire profile graph
+in a single call** — the Profile record plus PositionGroups, Positions,
+Educations, Companies, Schools, Industries and Geos — with the Profile
+referencing every remaining section (`*profileSkills`, `*profileCertifications`,
+`*profileLanguages`, and so on).
+
+This matters more than it first appears. LinkedIn's GraphQL endpoints are
+addressed by `queryId`, an opaque hash of a persisted query such as
+`voyagerIdentityDashProfileCards.2fdaa6b0…`. **Those hashes change with every
+LinkedIn web build**, and a hardcoded hash is the most common reason a service
+like this stops working. The endpoint above is plain REST addressed by
+`decorationId` — part of LinkedIn's published Rest.li model, and far more
+stable. Choosing it removes that fragility rather than working around it.
+
+### Rehydrating the normalized graph
+
+With the `normalized+json` Accept header, Voyager does not nest objects. It
+returns a flattened graph:
 
 ```jsonc
 {
@@ -312,56 +354,136 @@ With that Accept header, Voyager doesn't nest objects — it returns a flattened
 }
 ```
 
-Any key starting with `*` holds a URN pointing into `included[]` instead of the value. This exists so LinkedIn can send one company object even when forty positions reference it.
+Any key beginning with `*` holds a URN pointing into `included[]` rather than
+the value itself. This lets LinkedIn transmit one company object even when forty
+positions reference it.
 
-[`normalize.ts`](src/linkedin/normalize.ts) rebuilds the real object tree once, up front: index `included` by `entityUrn`, then walk the graph replacing `*key` references with resolved objects (exposing the raw URN alongside as `keyUrn`). Reference cycles are real — company → employee → company — so resolution carries a seen-set and marks cycles rather than recursing forever.
-
+[`normalize.ts`](src/linkedin/normalize.ts) rebuilds the real object tree once,
+up front: index `included` by `entityUrn`, then walk the graph replacing `*key`
+references with resolved objects while preserving the raw URN alongside as
+`keyUrn`. Reference cycles are real — company → employee → company — so
+resolution carries a seen-set and marks cycles instead of recursing forever.
 Every parser downstream then works against ordinary nested objects.
 
-### 3. A strategy chain, in order of reliability
+### Requests are issued from inside a browser
 
-LinkedIn's GraphQL endpoints are addressed by `queryId` — an opaque hash of a persisted query, like `voyagerIdentityDashProfileCards.2fdaa6b0…`. **Those hashes change whenever LinkedIn ships a new web build**, and a hardcoded hash is the single most common reason a scraper like this dies quietly.
+LinkedIn fingerprints considerably more than headers. A raw HTTP client has a
+different TLS/JA3 signature, different header ordering, and no JavaScript
+execution. In testing, a plain HTTP client authenticated successfully and then
+had its session invalidated server-side within a handful of requests.
 
-So extraction runs three strategies, most-reliable first:
+So the service issues the *same* Voyager calls via `fetch()` from inside an
+authenticated Chromium page. The request then carries Chrome's real TLS
+fingerprint, header ordering and cookie jar — because it genuinely is Chrome
+making a same-origin request. This remains API integration, not DOM scraping:
+the response is the same Voyager JSON, parsed by the same code.
+
+The raw HTTP transport is retained behind `ENABLE_HTTP_TRANSPORT=true`, off by
+default. It is the more direct expression of "call the API", and it is useful
+for demonstrating the protocol — but it is not the default, because it degrades
+the credential it depends on.
+
+### Extraction strategies
+
+Strategies run in order; the first to return a profile with a name wins.
 
 | # | Strategy | Transport | Notes |
 |---|---|---|---|
-| 1 | `browser-voyager` | Voyager called from inside an authenticated Chromium page | **Default.** Same endpoints, same parsers — the request simply carries Chrome's real TLS fingerprint, header ordering and cookie jar, because it genuinely is Chrome making a same-origin request. |
-| 2 | `voyager-graphql` | The same dash calls over raw HTTP (`undici`) | Faster and far cheaper, and the purest expression of "call the API directly". **Off by default** — see below. |
-| 3 | `voyager-profile-view` | Legacy REST, raw HTTP | One call returned *every* section and took no `queryId`. **Returns `410 Gone` as of 2026-08.** Retained because it costs one call to try and 410 is unambiguous. |
-| 4 | `browser` | Harvest payloads from the rendered profile page | Last resort. |
+| 1 | `browser-voyager` | Voyager from inside an authenticated page | **Default.** Verified against live profiles |
+| 2 | `voyager-graphql` | The same calls over raw HTTP | Off by default; see above |
+| 3 | `voyager-profile-view` | Legacy REST | Returned every section in one call, and took no `queryId`. **Withdrawn — returns `410 Gone`** |
+| 4 | `browser` | Payloads harvested from the rendered page | Last resort |
 
-> **Why raw HTTP is opt-in.** An HTTP client is trivially distinguishable from a
-> browser — different TLS/JA3 signature, different header ordering, no JS
-> execution. In testing, a raw client authenticated fine and then had its session
-> invalidated server-side within a handful of requests, while the browser
-> transport making the *identical* API calls kept working. Raw HTTP is preserved
-> behind `ENABLE_HTTP_TRANSPORT=true` because it is the more direct answer to
-> "reverse engineer the API", but it is not the default because it destroys the
-> credential it depends on.
-
-> **Note on ordering.** `profileView` was originally strategy 1 — it is
-> genuinely the better endpoint. Live testing showed LinkedIn now returns `410`
-> for both `/profileView` and `/networkinfo`, so the chain was reordered around
-> what actually works.
-
-The chain distinguishes **three** failure modes, and the distinction is
+Failure handling distinguishes **three** cases, and the distinction is
 load-bearing:
 
-- **Blocked** (`999`/`429`/`403`/`401`) → abort the chain immediately. Trying the next strategy on an identity LinkedIn just flagged only deepens the block.
-- **Endpoint retired** (`410`) → fall through at once. The identity is healthy; this route no longer exists, and it must not count against the identity's health.
+- **Blocked** (`999`/`429`/`403`/`401`) → abort the chain. Attempting the next
+  strategy with an identity LinkedIn has just flagged only deepens the block.
+- **Endpoint withdrawn** (`410`) → fall through immediately. The identity is
+  healthy; this route no longer exists, and it must not count against identity
+  health.
 - **Parse failure** → fall through to the next strategy.
 
-Collapsing the first two is a real bug, and it was one this codebase had: before
-live testing, `410` fell into the generic `>= 300` branch and was reported as
-`AUTH_FAILED`, which aborted the chain and made a retired endpoint look exactly
-like an expired cookie.
+Collapsing the first two is a genuine defect, and this codebase had it: `410`
+initially fell into the generic `>= 300` branch and was reported as
+`AUTH_FAILED`, which aborted the chain and made a withdrawn endpoint
+indistinguishable from an expired credential.
 
-#### Cookie scoping, and a bug it caused
+### Read path
 
-LinkedIn splits its cookies across two domains, and getting this wrong produces
-an error that points nowhere near the cause. Straight off the wire, from the
-`Set-Cookie` headers LinkedIn sends when invalidating a session:
+```
+request ─▶ parse URL ─▶ cache ──HIT (fresh)──▶ respond          no upstream traffic,
+                          │                                      no fetch budget spent
+                         MISS
+                          ▼
+                  fetch budget (5/min)
+                          ▼
+              identity pool ─▶ strategy chain ─▶ write cache ─▶ respond
+```
+
+A profile is fetched **once**. Every later request for the same profile is
+served from object storage without contacting LinkedIn.
+
+Concurrent requests for the same profile collapse into a single fetch
+([`profile-service.ts`](src/service/profile-service.ts)). Without that, ten
+simultaneous requests for one profile would consume ten of the five-per-minute
+slots performing identical work.
+
+Cache failures degrade rather than propagate: a failed read falls through to a
+live fetch, and a failed write still returns the response.
+
+---
+
+## Design decisions
+
+### Session handling: rotation, not replay
+
+The obvious approach — copy a session cookie once and reuse it — does not work,
+and fails in a way that resembles something else entirely.
+
+**LinkedIn rotates its session token on use and invalidates the previous
+value.** A copied cookie is a point-in-time snapshot that goes stale within
+minutes, and replaying a superseded token is the signature of a stolen cookie.
+LinkedIn responds by invalidating the session server-side:
+
+```http
+HTTP/2 302
+location: https://www.linkedin.com/voyager/api/me
+set-cookie: li_at=delete me; Expires=Thu, 01-Jan-1970 00:00:00 GMT; Max-Age=0
+```
+
+That is neither a rate limit nor an expiry — the credential is unrecoverable,
+and re-copying from the same browser session cannot produce a live one.
+Observed directly during development: a freshly-captured session authenticated
+successfully and returned `401` about a minute later from a new browser context,
+because the first request had already rotated the token and the new value was
+discarded along with the context.
+
+The remedy is persistence, not better headers:
+
+- Chromium runs against a **persistent profile directory**, so cookies,
+  localStorage, IndexedDB and device state survive restarts. These are the
+  signals LinkedIn's device recognition uses; a fresh context on every run
+  presents as a new device on every run.
+- The browser **stays open** between requests, and a keepalive touches the
+  upstream every eight minutes when idle, persisting whatever token was rotated
+  to.
+- Storage state is mirrored to object storage, so a rebuilt host recovers the
+  session rather than re-authenticating.
+
+The objective throughout is to authenticate **once**. Re-authentication is the
+most challenge-prone operation the service performs, so every mechanism above
+exists to avoid a second one. A circuit breaker enforces this: after three
+consecutive failed automatic logins — or immediately on a rejected credential —
+automatic login is suspended and the health endpoint reports that operator
+action is required. Retrying a credential that is simply wrong cannot succeed
+and moves the account towards a lockout.
+
+### Cookie scoping
+
+LinkedIn scopes its authentication cookies to `.www.linkedin.com` and its
+browser-identity cookies to `.linkedin.com`. This is observable directly in the
+`Set-Cookie` headers it sends when invalidating a session:
 
 ```
 li_at=delete me;   Domain=.www.linkedin.com
@@ -369,197 +491,295 @@ li_a="delete me";  Domain=.www.linkedin.com
 liap=delete me;    Domain=.linkedin.com
 ```
 
-Seeding every cookie on `.linkedin.com` — the obvious guess — means the browser
-never sends `li_at` to `www.linkedin.com`. LinkedIn treats the navigation as
-unauthenticated and answers with its "clear your cookies and retry" 302, which
-the browser follows forever: `ERR_TOO_MANY_REDIRECTS`. Nothing about that error
-suggests a cookie-scope bug. The API now scopes cookies per LinkedIn's own
-domains and reports the redirect loop as an actionable `AUTH_FAILED`.
+Placing them all on `.linkedin.com` — the intuitive choice — means the browser
+never sends the session cookie to `www.linkedin.com`. LinkedIn treats the
+navigation as unauthenticated and responds with its clear-and-retry redirect,
+which the browser follows indefinitely, surfacing as `ERR_TOO_MANY_REDIRECTS`.
+Nothing in that error suggests a cookie-scope problem.
 
-#### Header fidelity
+Cookies are also injected with `SameSite=Lax` rather than `None`. Chromium
+blocks `SameSite=None` cookies as third-party by default: they are stored but
+silently never sent. The service's requests are same-site, so `Lax` is both
+correct and unblocked.
 
-`x-li-track` is built per identity from that identity's own cookies rather than
-being a fixed constant, because LinkedIn cross-checks it. Sending
-`timezone: UTC` while the account's `timezone` cookie says `Asia/Calcutta` is an
-inconsistency a real browser never produces.
+### Identity rotation: rotate identities, not addresses
 
-### 4. Cache-first read path
+The naive design is a pool of proxies with requests distributed across them.
+**That design degrades credentials.** A session whose requests arrive from a
+different address each time resembles a credential being replayed elsewhere,
+which is precisely what upstream security checks exist to detect.
 
-```
-request ──▶ parse URL ──▶ GCS blob cache ──HIT (fresh)──▶ respond   (no LinkedIn traffic)
-                              │
-                             MISS
-                              ▼
-                       scrape limiter (5/min, hard)
-                              │
-                              ▼
-                   identity pool ──▶ strategy chain ──▶ write blob ──▶ respond
-```
-
-A profile is scraped **once**. Every later request for the same profile is served from `gs://<bucket>/profiles/<publicId>.json` without touching LinkedIn.
-
-Concurrent requests for the same profile are collapsed into a single scrape ([`profile-service.ts`](src/service/profile-service.ts)). Without that, ten simultaneous requests for one profile would burn ten of the five-per-minute slots doing identical work.
-
-Cache failures degrade rather than propagate: a failed read falls through to a live scrape, and a failed write still returns the response.
-
----
-
-## Design decisions
-
-### Rate limiting — two different limiters, protecting two different things
-
-| | `SCRAPE_RATE_PER_MINUTE` (5) | `@fastify/rate-limit` (60/min) |
-|---|---|---|
-| Protects | **The LinkedIn account** | The service |
-| Counts | Live LinkedIn fetches only | All HTTP requests |
-| Cache hits count? | **No** | Yes |
-
-Conflating them would be a mistake: a cache hit costs LinkedIn nothing, so charging it against the scrape budget would throttle traffic that isn't the risk.
-
-The scrape limiter is a **sliding window**, not a token bucket. A bucket refills continuously and permits a 2× burst across a window boundary — precisely the pattern that gets an account flagged. A sliding window makes "no more than 5 in *any* 60 seconds" literally true.
-
-> **This is why Cloud Run is pinned to `--max-instances=1`.** The limiter and the identity cooldowns are per-process. A second instance would silently double the rate actually reaching LinkedIn while both instances believed they were within budget. Scaling out requires moving the limiter to shared state (Redis) first — see [Known limitations](#known-limitations).
-
-### Proxy rotation — rotate identities, not IPs
-
-The naive design is a pool of proxies with requests round-robined across them. **That design actively burns accounts.** A LinkedIn session cookie whose requests arrive from a different IP every time looks exactly like a stolen cookie being replayed, which is what LinkedIn's security checkpoint is built to catch.
-
-So the unit of rotation here is an **identity** — a session cookie married to a fixed egress IP:
+The unit of rotation here is therefore an **identity** — a session bound to a
+fixed egress address:
 
 ```
-identity = { li_at cookie + JSESSIONID }  ⟷  { sticky proxy session }
+identity = { session } ⟷ { sticky proxy session }
 ```
 
-The pairing is permanent for the process lifetime, and the sticky session id is **derived from a hash of the cookie** rather than randomly generated — so an identity keeps the same egress IP across restarts and redeploys, which a random id would silently defeat.
+The binding is stable for the process lifetime, and the sticky session
+identifier is **derived from a hash of the credential** rather than randomly
+generated, so an identity keeps the same egress address across restarts and
+redeploys. A random identifier would silently defeat this.
 
 Each identity carries independent health state ([`pool.ts`](src/identity/pool.ts)):
 
-- **Selection** is least-recently-used among healthy identities, so load spreads evenly rather than hammering whichever is first.
-- **A block** triggers exponential backoff — 1 min, 2, 4, 8… capped at 1 hour — with ±20% jitter so multiple instances don't retry in lockstep.
-- **Five consecutive blocks quarantines** the identity outright. Continuing to retry a cookie LinkedIn has already flagged is how a temporary restriction becomes a permanent ban.
-- **Transient network errors don't trigger cooldown.** Only genuine push-back (`999`/`429`/`403`/`401`) does.
-- `GET /health` exposes per-identity state with proxy credentials stripped.
+- **Selection** is least-recently-used among healthy identities, so load spreads
+  evenly rather than concentrating on whichever is first.
+- **A block** triggers exponential backoff — 1, 2, 4, 8 minutes, capped at one
+  hour — with ±20% jitter, so multiple instances do not retry in lockstep.
+- **Five consecutive blocks quarantine** the identity. Continuing to retry a
+  credential that has already been flagged is how a temporary restriction
+  becomes a permanent one.
+- **Transient network errors do not trigger backoff.** Only genuine upstream
+  rejection (`999`/`429`/`403`/`401`) does.
+- `GET /health` reports per-identity state with proxy credentials stripped.
 
-The proxy layer is deliberately **provider-agnostic** — everything is a standard `http://user:pass@host:port` URL, the lowest common denominator across Webshare, IPRoyal, Decodo, Bright Data and self-hosted. For sticky sessions, `PROXY_STICKY_TEMPLATE` substitutes `{session}`:
+The proxy layer is provider-agnostic: everything is a standard
+`http://user:pass@host:port` URL, the lowest common denominator across
+commercial providers and self-hosted alternatives. For providers offering sticky
+sessions, `PROXY_STICKY_TEMPLATE` substitutes `{session}`:
 
 ```bash
-PROXY_STICKY_TEMPLATE=http://USER-session-{session}:PASS@gate.decodo.com:7000
+PROXY_STICKY_TEMPLATE=http://USER-session-{session}:PASS@gateway.example.com:7000
 ```
 
-> **Residential proxies are close to mandatory in production.** Cloud Run egresses from Google datacenter IP ranges, which LinkedIn flags aggressively — the service will work far longer through residential IPs than without.
+Residential proxies are close to mandatory at any scale: datacenter address
+ranges are flagged aggressively, and the service will operate considerably
+longer through residential addresses than without.
 
-### Why blob storage rather than a database
+### Object storage rather than a database
 
-The access pattern is a pure key/value get-or-scrape. There is no query surface, no joins, no transactions. A bucket needs no connection pool on cold start, costs nothing when idle (which matters when Cloud Run scales to zero), and gives object lifecycle rules for free. Cache entries are schema-versioned, so a breaking change to the response shape invalidates old blobs automatically instead of serving stale-shaped JSON.
+The access pattern is a pure key/value get-or-fetch. There is no query surface,
+no joins and no transactions. Object storage needs no connection pool on cold
+start, costs nothing when idle, and provides lifecycle expiry without additional
+machinery. Cache entries are schema-versioned, so a breaking change to the
+response shape invalidates prior entries automatically rather than serving
+stale-shaped JSON.
 
 ### Security
 
-- Secrets live in Secret Manager and are mounted at runtime — never in the repo, the service config, or build logs.
+- Credentials are held in the platform's secret store and injected at runtime;
+  none are committed, and none appear in build logs.
 - The logger redacts `cookie`, `x-api-key` and `authorization` headers.
-- `/health` reports proxy *hostnames* only; credentials are stripped by `redactProxy()`.
+- `/health` reports proxy *hostnames* only; credentials are stripped before
+  serialisation, and this is covered by a test.
 - API keys are compared in constant time.
-- The cache bucket has public-access prevention and uniform bucket-level access.
-- The service account holds `objectAdmin` on **one bucket** and `secretAccessor` on **named secrets** — not project-wide roles.
-- The container runs as non-root (`pwuser`).
-- `publicId` is validated against a strict charset and URL-encoded before use as an object path, so a crafted vanity name can't escape the bucket prefix.
+- The storage bucket has public-access prevention and uniform bucket-level
+  access.
+- The service account holds object-level access to **one bucket** and read
+  access to **named secrets** — not project-wide roles.
+- The container runs as a non-root user.
+- Identifiers are validated against a strict character set and URL-encoded
+  before use as storage paths, so a crafted vanity name cannot escape the
+  bucket prefix. This too is covered by a test.
+
+---
+
+## Running it yourself
+
+**Requirements:** Node.js 20 or newer, and a LinkedIn account.
+
+```bash
+git clone https://github.com/tchandrakar/tross-assignment.git
+cd tross-assignment
+npm install
+npx playwright install chromium
+cp .env.example .env
+```
+
+Add credentials to `.env`, then establish a session:
+
+```bash
+npm run login
+```
+
+A browser window opens, signs in, pauses if a verification challenge appears so
+it can be completed interactively, verifies the result against the upstream API,
+and writes the session to `.sessions/`.
+
+```bash
+npm run dev
+```
+
+The service listens on `http://localhost:8080`, with documentation at `/docs`.
+
+Once the session exists, `LI_PASSWORD` can be removed from `.env` for normal
+operation — it is read only when no valid session is available.
+
+> `.sessions/` contains a live authenticated session. It is gitignored and
+> written mode `0600`. Treat it as a credential.
+
+```bash
+npm test          # 121 unit tests, no network access required
+npm run typecheck # strict tsc
+npm run build     # compile to dist/
+```
+
+### Configuration
+
+Full reference in [`.env.example`](.env.example). The significant options:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LI_EMAIL` / `LI_PASSWORD` | — | Used to establish a session when none exists |
+| `SESSION_IDENTITIES` | — | Comma-separated identity labels whose sessions live in object storage. The production form: no credential in the service configuration at all |
+| `IDENTITY_LABEL` | `primary` | Names the identity, and keys its stored session |
+| `SESSION_STATE_DIR` | `.sessions` | Where session state is persisted locally |
+| `BROWSER_PROFILE_DIR` | `.sessions/profiles` | Persistent Chromium profiles, one per identity |
+| `LI_COOKIES` | — | A captured `cookie:` header, used as a one-time bootstrap seed |
+| `ENABLE_BROWSER_FALLBACK` | `true` | The browser transport |
+| `ENABLE_HTTP_TRANSPORT` | `false` | Raw HTTP transport; see [Requests are issued from inside a browser](#requests-are-issued-from-inside-a-browser) |
+| `SCRAPE_RATE_PER_MINUTE` | `5` | New profile fetches per minute |
+| `CLIENT_RATE_PER_MINUTE` | `10` | Requests per minute per caller |
+| `GLOBAL_RATE_PER_MINUTE` | `20` | Total requests per minute |
+| `CACHE_ENABLED` | `true` | Set `false` in development, where a cached copy would mask whether a parser change worked |
+| `CACHE_TTL_SECONDS` | `604800` | Cache lifetime. `0` disables expiry |
+| `GCS_BUCKET` | — | Object storage for the cache and session state. In-process LRU when unset |
+| `API_KEYS` | — | Comma-separated keys required as `x-api-key`. Unauthenticated when empty |
+| `PROXY_URLS` / `PROXY_STICKY_TEMPLATE` | — | Proxy pool configuration |
 
 ---
 
 ## Deployment
 
-Deployed to **Google Cloud Run** (asia-south1). One command, idempotent:
+Deployed to a Compute Engine instance behind Caddy, which terminates TLS with
+automatically provisioned and renewed certificates.
 
-```bash
-./scripts/deploy.sh
+A virtual machine was chosen over a serverless runtime for three reasons
+specific to this workload:
+
+- **A stable egress address.** The upstream correlates a session with the
+  address it was established from, so a fixed address is what the
+  identity-binding design requires. Serverless runtimes egress from rotating
+  pools.
+- **A persistent volume** for session state and the Chromium profile, so a
+  redeploy does not discard the established session.
+- **A warm browser process** across requests, which removes a multi-second cold
+  start from every call.
+
+The rate limiters and identity health are per-process, so the deployment runs a
+single instance. Horizontal scaling requires moving that state to a shared store
+first; this is a deliberate, documented trade-off rather than an oversight.
+
+### Continuous deployment
+
+`.github/workflows/deploy.yml` runs on every push to `main`:
+
+```
+test ─▶ build image ─▶ push to registry ─▶ publish session ─▶ roll out ─▶ verify
 ```
 
-It enables the required APIs, creates the Artifact Registry repo, the cache bucket and a least-privilege service account, builds the container with Cloud Build, and deploys.
-
-Establish the session locally first, then upload it — this is the one step the
-script won't do for you, because it's the one that touches credentials:
-
-```bash
-npm run login
-gcloud storage cp .sessions/primary.json gs://<bucket>/sessions/primary.json
-```
-
-On Cloud Run the session lives in the same bucket as the profile cache, because
-the container filesystem is ephemeral: without that, every cold start would
-replay a stale seed and re-trigger LinkedIn's replay detection.
-
-An identity still needs to exist for the pool to hand out. With credentials-only
-setup that is just a label:
+Verification checks container health on the host first, so a DNS or certificate
+problem is reported as itself rather than as a failed rollout. The public HTTPS
+check is non-fatal for the same reason.
 
 ```bash
-printf '%s' 'primary' | gcloud secrets create identity-label --data-file=-
+./scripts/smoke.sh https://linkedin.viral-engine.ai
 ```
 
-Optional secrets — attached automatically when present: `proxy-urls`, `proxy-sticky-template`, `api-keys`.
+The smoke test verifies the contract rather than merely that a port is open:
+liveness, health, OpenAPI availability, rejection of non-profile URLs, rejection
+of a missing parameter, a full profile fetch, and a cache hit on repeat.
 
-Then verify the deployment against its actual contract:
-
-```bash
-./scripts/smoke.sh https://<host>
-```
-
-### Running with Docker
+### Running under Docker
 
 ```bash
 docker build -t linkedin-profile-api .
 docker run -p 8080:8080 --env-file .env linkedin-profile-api
 ```
 
-### When LinkedIn rotates a queryId
-
-Symptom: strategy 1 works, strategy 2 returns empty. Fix without redeploying code:
-
-1. Open a LinkedIn profile in a browser with DevTools → Network, filtered to `graphql`.
-2. Copy the `queryId` query parameter from the profile-cards request.
-3. `gcloud run services update linkedin-profile-api --update-env-vars QID_PROFILE_CARDS=<new-id>`
-
 ---
 
 ## Known limitations
 
-**Fundamental to the approach**
+Engineering limitations, with the reason and the consequence for a consumer of
+the API.
 
-- **This violates LinkedIn's Terms of Service.** The account whose cookie is used can be restricted or permanently banned. See [Legal](#legal).
-- **Sessions need occasional manual re-establishment.** Persistence follows token rotation, but a password change, an explicit logout elsewhere, or a security challenge still ends the session. That surfaces as `AUTH_FAILED` (502) and needs `npm run login` again. There is no automated re-login inside the server, deliberately: automating LinkedIn login is the most reliable way to trigger a CAPTCHA and lock the account, so it stays a supervised, human-present step.
-- **Only one process may use a session at a time.** Two containers sharing stored state would rotate the token out from under each other — the same stale-replay problem, self-inflicted. Reinforces `--max-instances=1`.
-- **Session cookies expire, and can be killed early.** `li_at` nominally lasts ~12 months, but is invalidated by a password change, an explicit logout, a security challenge — or by LinkedIn deciding the cookie is being replayed (see [Why the whole jar matters](#why-the-whole-jar-matters)). Both surface as `AUTH_FAILED` (502) and need a manual cookie refresh. There is no automated re-login, deliberately: automating LinkedIn login is the single most reliable way to trigger a CAPTCHA challenge and lock the account.
-- **LinkedIn retires endpoints without notice.** `/profileView` and `/networkinfo` returned complete data for years and now return `410 Gone`. Nothing about this approach is stable by construction; the strategy chain limits the blast radius of any one retirement, it doesn't prevent them.
-- **`queryId` hashes rotate** with LinkedIn web builds and will eventually break strategy 2. Mitigated by ordering the queryId-free endpoint first and by env-var overrides, not eliminated.
-- **Datacenter IPs get blocked fast.** Without residential proxies, expect `999` responses from Cloud Run within tens of requests.
+### Data completeness
 
-**Data completeness**
+- **The service sees what its account can see.** Upstream visibility rules apply
+  exactly as they do in a browser: distant connections show truncated
+  experience, out-of-network profiles may show very little, and members can hide
+  sections entirely. **An empty section is frequently a privacy setting rather
+  than a defect** — `meta.missingSections` exists so a consumer can tell the two
+  apart.
+- **Connection and follower counts are `null`.** The endpoint that supplied
+  them has been withdrawn (`410 Gone`), and the current profile decoration does
+  not carry them. Reported as `null` rather than guessed.
+- **Skill endorsement counts are usually `null`.** The profile graph returns
+  skills without counts; obtaining them requires a request per skill, which is
+  not a good use of the fetch budget.
+- **Recommendations, contact details and post activity are not extracted.** Each
+  requires its own endpoint and its own fetch budget.
+- **Sections are limited to the first page.** Profiles with very many entries
+  may be truncated by the upstream's own pagination; additional pages are not
+  requested.
+- **Grouped multi-role positions are flattened.** Several roles at one employer
+  are returned as standalone entries with the company inherited; the grouping
+  itself is not preserved in the response.
+- **Media URLs are signed and expire**, typically after about 30 days.
+  `expiresAt` is reported on every image. Consumers needing permanence must
+  re-host the bytes.
 
-- **You only see what your account can see.** LinkedIn's visibility rules apply to the API exactly as they do in the browser: 3rd-degree connections show truncated experience, out-of-network profiles may show almost nothing, and some members hide sections entirely. An empty section is often a privacy setting, not a parsing bug — `meta.missingSections` is there to make that distinguishable.
-- **Recommendations, endorsement details, contact info and post activity are not extracted.** Each needs its own endpoint; the brief's field list doesn't include them.
-- **Skill endorsement counts are frequently `null`** — the card surface returns skills without counts, and fetching them needs a per-skill call that isn't worth the rate-limit budget.
-- **Connection and follower counts may be `null`** — `/networkinfo` is retired (410), so these are read from the dash profile record where present.
-- **Image URLs are signed and expire** (typically ~30 days). `expiresAt` is reported; callers needing permanence must re-host the bytes.
-- **Company and school logos come from whichever entity LinkedIn attached** — a position at a company with no LinkedIn page has no logo.
-- **Nested multi-role positions** (several roles at one employer) are flattened into standalone entries with the company inherited. The grouping itself is not preserved.
+### Operational
 
-**Operational**
+- **Single instance.** Rate limiters and identity health live in process memory,
+  so the configured limits are only accurate for one instance. Horizontal
+  scaling requires moving that state to Redis first.
+- **One process per session.** Two instances sharing stored session state would
+  rotate the upstream token out from under each other — the same
+  stale-replay failure described above, self-inflicted. This was observed
+  directly during development when a local process and the deployed instance
+  shared one session.
+- **Sessions occasionally need manual re-establishment.** Persistence follows
+  token rotation, but a password change, a sign-out elsewhere, or a security
+  challenge still ends a session. Automatic re-authentication is attempted, and
+  suspended by the circuit breaker if it fails, because unattended
+  re-authentication is challenge-prone by nature. `GET /health` reports when
+  operator action is required.
+- **Cold start is slow.** The first request after a restart pays roughly 5–10
+  seconds to launch Chromium and establish the page; subsequent requests are
+  1–5 seconds. Measured: 9.9s cold, 4.8s warm.
+- **Memory.** Chromium requires roughly 300 MB resident; the instance is sized
+  accordingly.
+- **In-memory cache when object storage is unconfigured** — adequate for local
+  development, not across instances.
 
-- **Single instance only.** The scrape limiter and identity cooldowns are in-process, so `--max-instances=1` is required for the 5/min ceiling to be real. Horizontal scaling needs the limiter moved to Redis first.
-- **In-memory cache when `GCS_BUCKET` is unset** — fine for local dev, useless across containers.
-- **Cold starts are slow** (~3-6s) because the image carries Chromium. Set `--min-instances=1` to trade cost for latency.
-- **The browser fallback is memory-hungry** (~300 MB RSS) and needs the 2 GiB Cloud Run allocation.
-- **No pagination on long profiles.** Profiles with very many positions may be truncated by LinkedIn's own card pagination; only the first page of each section is read.
+### Upstream coupling
+
+- **Endpoints are withdrawn without notice.** `/profileView` and `/networkinfo`
+  returned complete data for years and now return `410 Gone`. The strategy chain
+  limits the blast radius of any single withdrawal; it cannot prevent them.
+- **Response shapes change without notice.** Parsers are written defensively —
+  every field access is optional with fallbacks — and `meta.missingSections`
+  surfaces partial extraction rather than hiding it. A shape change still
+  requires a code change.
+- **Automated access is actively detected.** Approaches that work today may stop
+  working. The browser transport, header fidelity and identity binding
+  substantially extend the useful life of a session, but none of it is
+  permanent.
 
 ---
 
-## Legal
+## Legal and compliance
 
-This project was built for the Tross engineering hiring challenge, which explicitly asks for reverse-engineered LinkedIn API access using the developer's own credentials.
+Automated collection of LinkedIn data is inconsistent with the
+[LinkedIn User Agreement](https://www.linkedin.com/legal/user-agreement) §8.2,
+irrespective of whether the data is publicly visible. *hiQ Labs v. LinkedIn*
+established that scraping publicly accessible data is not a Computer Fraud and
+Abuse Act violation in the United States, but that is a finding on criminal
+liability, not authorisation: LinkedIn enforces its terms contractually and
+terminates accounts.
 
-Scraping LinkedIn violates the [LinkedIn User Agreement](https://www.linkedin.com/legal/user-agreement) §8.2, regardless of whether the data is public. *hiQ Labs v. LinkedIn* established that scraping public data isn't a CFAA violation in the US — but that's a criminal-liability finding, not permission. LinkedIn can and does terminate accounts, and enforces its ToS contractually.
+Profile data concerning identifiable individuals is personal data under the GDPR
+and India's DPDP Act. Collecting it engages those regimes independently of what
+any platform permits, and a production deployment would require a lawful basis,
+a retention policy and a subject-access process.
 
-Practically, that means: use an account you can afford to lose, keep the rate limit low, and don't redistribute scraped personal data. Profile data about identifiable people is personal data under GDPR/DPDP — collecting it engages those regimes independently of what LinkedIn permits.
-
-This code is for evaluation. Don't run it at scale against real people.
+Accordingly, this service is built for evaluation. It uses a dedicated account,
+enforces a conservative fetch ceiling, caches aggressively to minimise upstream
+traffic, and is not intended for bulk collection or redistribution of personal
+data.
 
 ---
 
@@ -567,33 +787,35 @@ This code is for evaluation. Don't run it at scale against real people.
 
 ```
 src/
-├── index.ts                    entrypoint, graceful shutdown
-├── server.ts                   Fastify app, auth, error handling
-├── config.ts                   env parsing — the only module that reads secrets
-├── errors.ts                   error taxonomy → HTTP status mapping
-├── openapi.ts                  OpenAPI doc generated from the Zod schemas
-├── schema/profile.ts           the public response contract
+├── index.ts                      entrypoint, graceful shutdown
+├── server.ts                     HTTP app, auth, rate limits, error handling
+├── config.ts                     environment parsing — the only module reading secrets
+├── errors.ts                     error taxonomy → HTTP status mapping
+├── openapi.ts                    OpenAPI document generated from the Zod schemas
+├── schema/profile.ts             the public response contract
 ├── browser/
-│   ├── session.ts              warmed authenticated Chromium; in-page Voyager calls
-│   ├── session-store.ts        storage-state persistence (file + GCS)
-│   ├── login.ts                interactive login helper
-│   └── login-cli.ts            `npm run login`
+│   ├── session.ts                persistent authenticated Chromium; in-page Voyager calls
+│   ├── session-store.ts          session persistence (filesystem + object storage)
+│   ├── login.ts                  session establishment, shared by CLI and service
+│   └── login-cli.ts              `npm run login`
 ├── linkedin/
-│   ├── url.ts                  profile URL → publicId
-│   ├── voyager-client.ts       raw-HTTP Voyager transport
-│   ├── endpoints.ts            endpoint catalogue + queryId overrides
-│   ├── normalize.ts            normalized-graph rehydration
-│   ├── scraper.ts              transports + the strategy chain
+│   ├── url.ts                    profile URL → identifier
+│   ├── voyager-client.ts         raw HTTP transport
+│   ├── endpoints.ts              endpoint catalogue
+│   ├── normalize.ts              normalized-graph rehydration
+│   ├── scraper.ts                transports and the strategy chain
 │   └── parse/
-│       ├── common.ts           dates, images, union unwrapping
-│       ├── profile-view.ts     legacy REST parser
-│       └── dash-cards.ts       GraphQL card parser
+│       ├── common.ts             dates, media, union unwrapping
+│       ├── dash-profile.ts       primary profile-graph parser
+│       ├── profile-view.ts       legacy REST parser
+│       └── dash-cards.ts         component-tree parser
 ├── identity/
-│   ├── pool.ts                 identity rotation + health
-│   └── proxy.ts                provider-agnostic proxy plumbing
-├── cache/{gcs,memory}.ts       profile blob cache + local fallback
-├── ratelimit/scrape-limiter.ts sliding-window scrape ceiling
-├── service/profile-service.ts  cache-first read path, single-flight
-└── routes/                     HTTP layer
+│   ├── pool.ts                   identity rotation and health
+│   └── proxy.ts                  provider-agnostic proxy plumbing
+├── cache/{gcs,memory}.ts         profile cache and local fallback
+├── ratelimit/
+│   ├── sliding-window.ts         shared limiter primitives
+│   └── scrape-limiter.ts         upstream fetch ceiling
+├── service/profile-service.ts    cache-first read path, request collapsing
+└── routes/                       HTTP layer
 ```
-
