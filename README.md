@@ -15,6 +15,7 @@ curl -s --get \
 | **Base URL** | `https://linkedin.viral-engine.ai` |
 | **Interactive docs** | [`/docs`](https://linkedin.viral-engine.ai/docs) · OpenAPI 3.0 at [`/docs/json`](https://linkedin.viral-engine.ai/docs/json) |
 | **Health** | [`/health`](https://linkedin.viral-engine.ai/health) |
+| **Postman** | [`postman/`](postman/) — importable collection with assertions and saved examples |
 | **Source** | [github.com/tchandrakar/tross-assignment](https://github.com/tchandrakar/tross-assignment) |
 
 ---
@@ -714,6 +715,18 @@ check is non-fatal for the same reason.
 The smoke test verifies the contract rather than merely that a port is open:
 liveness, health, OpenAPI availability, rejection of non-profile URLs, rejection
 of a missing parameter, a full profile fetch, and a cache hit on repeat.
+
+### Postman collection
+
+A runnable collection lives in [`postman/`](postman/) — 12 requests with
+assertions on every response and examples captured from the live service.
+
+```bash
+npm run postman
+```
+
+See [`postman/README.md`](postman/README.md) for import instructions and what
+the assertions cover.
 
 ### Running under Docker
 

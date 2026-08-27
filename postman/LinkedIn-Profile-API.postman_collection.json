@@ -1,0 +1,804 @@
+{
+  "info": {
+    "name": "LinkedIn Profile API",
+    "_postman_id": "9b1f4d2e-6c3a-4f18-9a07-2d5e8c1b7a34",
+    "description": "# LinkedIn Profile API\n\nAccepts a LinkedIn profile URL and returns the profile as structured JSON \u2014 name, headline, location, summary, positions, education, skills, certifications, languages and media.\n\nData is read from LinkedIn's internal Voyager API, the same endpoints linkedin.com's own single-page application calls, rather than by parsing rendered HTML.\n\n**Base URL:** `https://linkedin.viral-engine.ai`\n\n---\n\n## Getting started\n\n1. Select the **LinkedIn Profile API \u2014 Production** environment.\n2. Send **Profile \u2192 Get profile by URL**.\n\nNo credential is needed unless the deployment is configured with API keys, in which case set `apiKey` in the environment and enable the `x-api-key` header.\n\n---\n\n## Rate limits\n\nThree independent tiers, because they protect different things:\n\n| Tier | Limit | Scope | Purpose |\n|---|---|---|---|\n| New profile fetches | 5/min | Service-wide | Protects the upstream account |\n| Per caller | 10/min | Per API key, else client IP | Stops one caller consuming the service |\n| Service total | 20/min | All callers | Bounds total load |\n\n**A cache hit contacts the upstream not at all, so it never consumes fetch budget.** Already-known profiles keep resolving at the full per-caller rate even when the fetch budget is exhausted.\n\nEvery `429` carries a `retry-after` header and a `retryAfterSeconds` field.\n\n---\n\n## Response conventions\n\n- Every response carries a boolean `success`, so a client can branch on one field before reading anything else.\n- `null` means \"we looked and LinkedIn did not have it\". Every array is always present, possibly empty, so a client never branches on `undefined` before iterating.\n- Dates are structured `{ day, month, year }` with nullable parts, because LinkedIn stores month + year for most entries and sometimes only a year. A preformatted string would destroy that precision and impose one locale.\n- `meta.missingSections` distinguishes \"the member has none\" from \"we could not read it\", so a consumer never records an absence that was really a failure.\n\n---\n\n## Timing\n\n| Path | Typical |\n|---|---|\n| Cache hit | 30\u201380 ms |\n| Live fetch, warm session | 1\u20137 s |\n| Live fetch, cold session | up to ~10 s |\n\nSet a client timeout of at least 30 s for live fetches.\n\n---\n\nSource: https://github.com/tchandrakar/tross-assignment",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Profile",
+      "description": "Profile retrieval and cache control.",
+      "item": [
+        {
+          "name": "Get profile by URL",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text",
+                "description": "Only required when the deployment is configured with API keys.",
+                "disabled": true
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/profile?url={{profileUrl}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "profile"
+              ],
+              "query": [
+                {
+                  "key": "url",
+                  "value": "{{profileUrl}}",
+                  "description": "A LinkedIn profile URL, or a bare vanity name."
+                }
+              ]
+            },
+            "description": "Returns the profile as structured JSON.\n\nServed from cache when a stored copy exists and is within TTL \u2014 a cache hit contacts LinkedIn not at all, and therefore consumes no fetch budget. Otherwise performs one live fetch.\n\nInspect `x-cache` and `meta.cached` to tell the two apart."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "",
+                  "const body = pm.response.json();",
+                  "pm.test('success discriminator is true', () => pm.expect(body.success).to.be.true);",
+                  "",
+                  "const d = body.data;",
+                  "pm.test('identity fields present', () => {",
+                  "    pm.expect(d).to.have.property('publicId').that.is.a('string');",
+                  "    pm.expect(d).to.have.property('profileUrl').that.is.a('string');",
+                  "    pm.expect(d).to.have.property('fullName');",
+                  "});",
+                  "",
+                  "pm.test('every collection is present, even when empty', () => {",
+                  "    ['experience','education','skills','certifications','languages',",
+                  "     'projects','publications','honors','volunteering'].forEach((k) => {",
+                  "        pm.expect(d[k], k).to.be.an('array');",
+                  "    });",
+                  "});",
+                  "",
+                  "pm.test('location is an object with the documented shape', () => {",
+                  "    pm.expect(d.location).to.be.an('object');",
+                  "    ['full','city','country','countryCode'].forEach((k) =>",
+                  "        pm.expect(d.location).to.have.property(k));",
+                  "});",
+                  "",
+                  "pm.test('dates are structured, not preformatted strings', () => {",
+                  "    d.experience.forEach((e) => {",
+                  "        pm.expect(e.dates).to.be.an('object');",
+                  "        pm.expect(e.dates).to.have.property('current').that.is.a('boolean');",
+                  "        if (e.dates.start) pm.expect(e.dates.start).to.have.property('year');",
+                  "    });",
+                  "});",
+                  "",
+                  "pm.test('meta reports provenance', () => {",
+                  "    pm.expect(body.meta.source).to.be.oneOf(",
+                  "        ['browser-voyager','voyager-graphql','voyager-profile-view','browser','cache']);",
+                  "    pm.expect(body.meta.cached).to.be.a('boolean');",
+                  "    pm.expect(body.meta.missingSections).to.be.an('array');",
+                  "});",
+                  "",
+                  "pm.test('x-cache header agrees with meta.cached', () => {",
+                  "    const header = pm.response.headers.get('x-cache');",
+                  "    pm.expect(header).to.equal(body.meta.cached ? 'HIT' : 'MISS');",
+                  "});",
+                  "",
+                  "// Handy for chaining a later request.",
+                  "pm.collectionVariables.set('lastPublicId', d.publicId);"
+                ],
+                "packages": {}
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 \u2014 profile",
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json; charset=utf-8"
+                },
+                {
+                  "key": "x-cache",
+                  "value": "HIT"
+                },
+                {
+                  "key": "x-source",
+                  "value": "browser-voyager"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"success\": true,\n  \"data\": {\n    \"publicId\": \"jayminkansara\",\n    \"profileUrl\": \"https://www.linkedin.com/in/jayminkansara/\",\n    \"urn\": \"urn:li:fsd_profile:ACoAAAEq6NMBlyRF4S9e3jIY0zv1Y5GbynF45no\",\n    \"firstName\": \"Jaymin\",\n    \"lastName\": \"K.\",\n    \"fullName\": \"Jaymin K.\",\n    \"headline\": \"Internet Business Development Manager at Confidential\",\n    \"about\": \"Jaymin Kansara , India. I have been serving as Marketing Manager for the last 10 Years. My core area of expertise is Marketing and Export-Import. Capable of Handling entire Marketing function including Marketing operations.\",\n    \"location\": {\n      \"full\": \"Ahmedabad, Gujarat, India\",\n      \"city\": \"Ahmedabad\",\n      \"country\": \"India\",\n      \"countryCode\": \"IN\"\n    },\n    \"industry\": \"Electrical & Electronic Manufacturing\",\n    \"pronouns\": null,\n    \"connectionCount\": null,\n    \"followerCount\": null,\n    \"isPremium\": false,\n    \"isInfluencer\": false,\n    \"isOpenToWork\": false,\n    \"isHiring\": false,\n    \"profilePicture\": {\n      \"url\": \"https://media.licdn.com/dms/image/v2/D4D03AQG6XJlCmzUnKg/profile-displayphoto-shrink_800_800/profile-displayphoto-shrink_800_800/0/1695284361229?e=1789603200&v=beta&t=CbCvfW4cmQ8lrhfIu0AikHNdaHOnCYKhyPQd8ZpRfGM\",\n      \"width\": 800,\n      \"height\": 800,\n      \"expiresAt\": \"2026-09-17T00:00:00.000Z\"\n    },\n    \"backgroundImage\": {\n      \"url\": \"https://media.licdn.com/dms/image/v2/C4D16AQFLRl68QAhTwA/profile-displaybackgroundimage-shrink_200_800/profile-displaybackgroundimage-shrink_200_800/0/1635928797669?e=1789603200&v=beta&t=HVvPKKsqpRUe7veDx0BZD3kyBBBHjqnb9UdJqaVaedM\",\n      \"width\": 704,\n      \"height\": 176,\n      \"expiresAt\": \"2026-09-17T00:00:00.000Z\"\n    },\n    \"experience\": [\n      {\n        \"title\": \"Sr. General Manager - Marketing\",\n        \"employmentType\": null,\n        \"company\": \"Confidential (In stealth mode)\",\n        \"companyLinkedinUrl\": null,\n        \"companyLogo\": null,\n        \"location\": \"Ahmedabad, Gujarat\",\n        \"workplaceType\": null,\n        \"description\": \"Responsible for managing campaigns to develop business.\",\n        \"dates\": {\n          \"start\": {\n            \"day\": null,\n            \"month\": 7,\n            \"year\": 2015\n          },\n          \"end\": {\n            \"day\": null,\n            \"month\": 7,\n            \"year\": 2016\n          },\n          \"current\": false,\n          \"durationMonths\": 12\n        },\n        \"skills\": []\n      },\n      {\n        \"title\": \"Team Leader Marketing Coordinator\",\n        \"employmentType\": null,\n        \"company\": \"xyz\",\n        \"companyLinkedinUrl\": null,\n        \"companyLogo\": null,\n        \"location\": \"Ahmedabad, Gujarat\",\n        \"workplaceType\": null,\n        \"description\": \"Responsible for bringing synergy to the whole marketing division. Responsible for channelizing efforts in the entire marketing division. Responsible for Event Management, Award Participation, Online Public relation, offline public relation, Media buying, Digital Marketing, Digital Advertising.\",\n        \"dates\": {\n          \"start\": {\n            \"day\": null,\n            \"month\": 6,\n            \"year\": 2013\n          },\n          \"end\": {\n            \"day\": null,\n            \"month\": 6,\n            \"year\": 2015\n          },\n          \"current\": false,\n          \"durationMonths\": 24\n        },\n        \"skills\": []\n      },\n      {\n        \"title\": \"Internet Business Development Manager\",\n        \"employmentType\": null,\n        \"company\": \"xyz\",\n        \"companyLinkedinUrl\": null,\n        \"companyLogo\": null,\n        \"location\": \"Ahmedabad, Gujarat\",\n        \"workplaceType\": null,\n        \"description\": \"Responsible for end to end India Marketing function. Responsible for Foreign Business Development and Export Operations.\",\n        \"dates\": {\n          \"start\": {\n            \"day\": null,\n            \"month\": 5,\n            \"year\": 2010\n          },\n          \"end\": {\n            \"day\": null,\n            \"month\": 5,\n            \"year\": 2013\n          },\n          \"current\": false,\n          \"durationMonths\": 36\n        },\n        \"skills\": []\n      }\n    ],\n    \"education\": [\n      {\n        \"school\": \"Nirma University, Ahmedabad, Gujarat, India\",\n        \"schoolLinkedinUrl\": \"https://www.linkedin.com/school/nirma-university-ahmedabad-gujarat-india/\",\n        \"schoolLogo\": {\n          \"url\": \"https://media.licdn.com/dms/image/v2/D4D0BAQHZ6vmo4k-kqw/company-logo_400_400/company-logo_400_400/0/1708176267470?e=1789603200&v=beta&t=unruR1t6ViusyxK8SIq4vMfe19XL4J5pgRYInEsxQwI\",\n          \"width\": 400,\n          \"height\": 400,\n          \"expiresAt\": \"2026-09-17T00:00:00.000Z\"\n        },\n        \"degree\": \"Master of Business Administration - MBA\",\n        \"fieldOfStudy\": \"Marketing/Marketing Management, General\",\n        \"grade\": \"B\",\n        \"activities\": null,\n        \"description\": null,\n        \"dates\": {\n          \"start\": {\n            \"day\": null,\n            \"month\": null,\n            \"year\": 2008\n          },\n          \"end\": {\n            \"day\": null,\n            \"month\": null,\n            \"year\": 2011\n          },\n          \"current\": false,\n          \"durationMonths\": 47\n        }\n      },\n      {\n        \"school\": \"DOEACC\",\n        \"schoolLinkedinUrl\": \"https://www.linkedin.com/school/doeacc/\",\n        \"schoolLogo\": null,\n        \"degree\": \"O LEVEL\",\n        \"fieldOfStudy\": \"Computer and Information Sciences and Support Services\",\n        \"grade\": \"A\",\n        \"activities\": null,\n        \"description\": null,\n        \"dates\": {\n          \"start\": {\n            \"day\": null,\n            \"month\": null,\n            \"year\": 2003\n          },\n          \"end\": {\n            \"day\": null,\n            \"month\": null,\n            \"year\": 2004\n          },\n          \"current\": false,\n          \"durationMonths\": 23\n        }\n      },\n      {\n        \"school\": \"Hemchandracharya North Gujart University, Patan\",\n        \"schoolLinkedinUrl\": \"https://www.linkedin.com/school/hemchandracharya-north-gujart-university-patan/\",\n        \"schoolLogo\": null,\n        \"degree\": \"PGDCA\",\n        \"fieldOfStudy\": \"Computer and Information Sciences and Support Services\",\n        \"grade\": \"B\",\n        \"activities\": null,\n        \"description\": null,\n        \"dates\": {\n          \"start\": {\n            \"day\": null,\n            \"month\": null,\n            \"year\": 2000\n          },\n          \"end\": {\n            \"day\": null,\n            \"month\": null,\n            \"year\": 2002\n          },\n          \"current\": false,\n          \"durationMonths\": 35\n        }\n      },\n      {\n        \"school\": \"MB Patel Science College, Anand\",\n        \"schoolLinkedinUrl\": \"https://www.linkedin.com/school/mb-patel-science-college-anand/\",\n        \"schoolLogo\": null,\n        \"degree\": \"Bachelor of Science - BS\",\n        \"fieldOfStudy\": \"Chemistry\",\n        \"grade\": null,\n        \"activities\": null,\n        \"description\": null,\n        \"dates\": {\n          \"start\": {\n            \"day\": null,\n            \"month\": null,\n            \"year\": 1997\n          },\n          \"end\": {\n            \"day\": null,\n            \"month\": null,\n            \"year\": 2000\n          },\n          \"current\": false,\n          \"durationMonths\": 47\n        }\n      }\n    ],\n    \"skills\": [\n      {\n        \"name\": \"Marketing\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Online Marketing\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Relationship Marketing\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Digital Marketing\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Market Research\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Digital Strategy\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Digital Media\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Public Relations\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Marketing Strategy\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Product Marketing\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Marketing Management\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Email Marketing\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Direct Marketing\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Search Engine Marketing (SEM)\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Trade Marketing\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Mobile Marketing\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Sports Marketing\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"Integrated Marketing\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"B2B Marketing\",\n        \"endorsementCount\": null\n      },\n      {\n        \"name\": \"International Marketing\",\n        \"endorsementCount\": null\n      }\n    ],\n    \"certifications\": [\n      {\n        \"name\": \"HubSpot Sales Hub Certification\",\n        \"issuer\": \"HubSpot\",\n        \"issuerLogo\": {\n          \"url\": \"https://media.licdn.com/dms/image/v2/C4D0BAQF8H-SLmMDZlA/company-logo_400_400/company-logo_400_400/0/1646683330132/hubspot_logo?e=1789603200&v=beta&t=Bvc3GzSoPfsfG8U6C1tsIHeMLNbL8sO8lccKLT4mM6k\",\n          \"width\": 400,\n          \"height\": 400,\n          \"expiresAt\": \"2026-09-17T00:00:00.000Z\"\n        },\n        \"issuedAt\": {\n          \"day\": null,\n          \"month\": 11,\n          \"year\": 2025\n        },\n        \"expiresAt\": null,\n        \"credentialId\": null,\n        \"credentialUrl\": null\n      },\n      {\n        \"name\": \"HubSpot Marketing Hub Certification\",\n        \"issuer\": \"HubSpot\",\n        \"issuerLogo\": {\n          \"url\": \"https://media.licdn.com/dms/image/v2/C4D0BAQF8H-SLmMDZlA/company-logo_400_400/company-logo_400_400/0/1646683330132/hubspot_logo?e=1789603200&v=beta&t=Bvc3GzSoPfsfG8U6C1tsIHeMLNbL8sO8lccKLT4mM6k\",\n          \"width\": 400,\n          \"height\": 400,\n          \"expiresAt\": \"2026-09-17T00:00:00.000Z\"\n        },\n        \"issuedAt\": {\n          \"day\": null,\n          \"month\": 10,\n          \"year\": 2025\n        },\n        \"expiresAt\": null,\n        \"credentialId\": null,\n        \"credentialUrl\": null\n      },\n      {\n        \"name\": \"Google Digital Garage - Fundamentals of Digital Marketing\",\n        \"issuer\": \"Google Digital Garage\",\n        \"issuerLogo\": null,\n        \"issuedAt\": null,\n        \"expiresAt\": null,\n        \"credentialId\": null,\n        \"credentialUrl\": null\n      },\n      {\n        \"name\": \"HubSpot Content Marketing Certified\",\n        \"issuer\": \"HubSpot Academy\",\n        \"issuerLogo\": {\n          \"url\": \"https://media.licdn.com/dms/image/v2/D560BAQFGt4XAU9bF5w/company-logo_400_400/company-logo_400_400/0/1719518128249/hubspot_academy_logo?e=1789603200&v=beta&t=2TqlBhOmnTUzYtsgQ22ozxvCIj39JcT1DgF80MDGypo\",\n          \"width\": 400,\n          \"height\": 400,\n          \"expiresAt\": \"2026-09-17T00:00:00.000Z\"\n        },\n        \"issuedAt\": null,\n        \"expiresAt\": null,\n        \"credentialId\": null,\n        \"credentialUrl\": null\n      },\n      {\n        \"name\": \"HubSpot Contextual Marketing Certified\",\n        \"issuer\": \"HubSpot Academy\",\n        \"issuerLogo\": {\n          \"url\": \"https://media.licdn.com/dms/image/v2/D560BAQFGt4XAU9bF5w/company-logo_400_400/company-logo_400_400/0/1719518128249/hubspot_academy_logo?e=1789603200&v=beta&t=2TqlBhOmnTUzYtsgQ22ozxvCIj39JcT1DgF80MDGypo\",\n          \"width\": 400,\n          \"height\": 400,\n          \"expiresAt\": \"2026-09-17T00:00:00.000Z\"\n        },\n        \"issuedAt\": null,\n        \"expiresAt\": null,\n        \"credentialId\": null,\n        \"credentialUrl\": null\n      },\n      {\n        \"name\": \"HubSpot Email Marketing Certified\",\n        \"issuer\": \"HubSpot Academy\",\n        \"issuerLogo\": {\n          \"url\": \"https://media.licdn.com/dms/image/v2/D560BAQFGt4XAU9bF5w/company-logo_400_400/company-logo_400_400/0/1719518128249/hubspot_academy_logo?e=1789603200&v=beta&t=2TqlBhOmnTUzYtsgQ22ozxvCIj39JcT1DgF80MDGypo\",\n          \"width\": 400,\n          \"height\": 400,\n          \"expiresAt\": \"2026-09-17T00:00:00.000Z\"\n        },\n        \"issuedAt\": null,\n        \"expiresAt\": null,\n        \"credentialId\": null,\n        \"credentialUrl\": null\n      }\n    ],\n    \"languages\": [\n      {\n        \"name\": \"English\",\n        \"proficiency\": \"Full professional proficiency\"\n      },\n      {\n        \"name\": \"Gujarati\",\n        \"proficiency\": \"Native or bilingual proficiency\"\n      },\n      {\n        \"name\": \"Hindi\",\n        \"proficiency\": \"Native or bilingual proficiency\"\n      }\n    ],\n    \"projects\": [],\n    \"publications\": [],\n    \"honors\": [\n      {\n        \"title\": \"Employee of the Month\",\n        \"issuer\": \"Confidential\",\n        \"description\": \"Employee of the month.\",\n        \"issuedAt\": {\n          \"day\": null,\n          \"month\": 8,\n          \"year\": 2022\n        }\n      }\n    ],\n    \"volunteering\": []\n  },\n  \"meta\": {\n    \"cached\": true,\n    \"source\": \"browser-voyager\",\n    \"scrapedAt\": \"2026-08-27T04:41:28.724Z\",\n    \"ageSeconds\": 5394,\n    \"durationMs\": 66,\n    \"missingSections\": [\n      \"projects\",\n      \"publications\",\n      \"volunteering\"\n    ]\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "Get profile by vanity name",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/profile?url=williamhgates",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "profile"
+              ],
+              "query": [
+                {
+                  "key": "url",
+                  "value": "williamhgates"
+                }
+              ]
+            },
+            "description": "The `url` parameter accepts a bare vanity name as well as a full URL. All of these resolve identically:\n\n- `https://www.linkedin.com/in/williamhgates/`\n- `https://linkedin.com/in/williamhgates`\n- `https://in.linkedin.com/in/williamhgates?originalSubdomain=in`\n- `www.linkedin.com/in/williamhgates/en`\n- `williamhgates`"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('bare vanity name resolves to the canonical URL', () => {",
+                  "    const d = pm.response.json().data;",
+                  "    pm.expect(d.publicId).to.equal('williamhgates');",
+                  "    pm.expect(d.profileUrl).to.equal('https://www.linkedin.com/in/williamhgates/');",
+                  "});"
+                ],
+                "packages": {}
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "Force a live fetch (refresh=true)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/profile?url={{profileUrl}}&refresh=true",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "profile"
+              ],
+              "query": [
+                {
+                  "key": "url",
+                  "value": "{{profileUrl}}"
+                },
+                {
+                  "key": "refresh",
+                  "value": "true",
+                  "description": "Bypass the cache. Consumes fetch budget."
+                }
+              ]
+            },
+            "description": "Bypasses the cache and fetches from LinkedIn even when a fresh copy is stored.\n\nThis consumes one of the 5-per-minute fetch slots, so use it deliberately. Expect a multi-second response: a live fetch is roughly 1\u20137s warm, and up to ~10s if the browser session has to be established first."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('refresh bypassed the cache', () => {",
+                  "    pm.expect(body.meta.cached).to.be.false;",
+                  "    pm.expect(body.meta.ageSeconds).to.equal(0);",
+                  "    pm.expect(pm.response.headers.get('x-cache')).to.equal('MISS');",
+                  "});"
+                ],
+                "packages": {}
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "Get profile (POST body)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://www.linkedin.com/in/williamhgates/\",\n  \"refresh\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/profile",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "profile"
+              ]
+            },
+            "description": "Identical semantics to `GET /v1/profile`. Provided for clients that prefer not to place identifiers in query strings, where they end up in access logs and browser history."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('same envelope as GET', () => {",
+                  "    const b = pm.response.json();",
+                  "    pm.expect(b.success).to.be.true;",
+                  "    pm.expect(b).to.have.property('data');",
+                  "    pm.expect(b).to.have.property('meta');",
+                  "});"
+                ],
+                "packages": {}
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "Rejects a company URL (400)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/profile?url=https://www.linkedin.com/company/google",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "profile"
+              ],
+              "query": [
+                {
+                  "key": "url",
+                  "value": "https://www.linkedin.com/company/google"
+                }
+              ]
+            },
+            "description": "Only member profiles (`/in/\u2026`) are supported. Company and school URLs are rejected explicitly rather than misinterpreted as members \u2014 a silent misparse would return a confidently wrong profile."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+                  "const body = pm.response.json();",
+                  "pm.test('typed error, not a bare message', () => {",
+                  "    pm.expect(body.success).to.be.false;",
+                  "    pm.expect(body.error.code).to.equal('INVALID_URL');",
+                  "    pm.expect(body.error.message).to.be.a('string').and.not.empty;",
+                  "});"
+                ],
+                "packages": {}
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "400 \u2014 not a member profile",
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json; charset=utf-8"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"success\": false,\n  \"error\": {\n    \"code\": \"INVALID_URL\",\n    \"message\": \"This is a company URL, not a member profile. Only /in/ URLs are supported.\"\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "Evict a cached profile",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/profile/{{publicId}}/cache",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "profile",
+                "{{publicId}}",
+                "cache"
+              ],
+              "variable": [
+                {
+                  "key": "publicId",
+                  "value": "williamhgates"
+                }
+              ]
+            },
+            "description": "Removes one profile from the cache. The next request for it performs a live fetch.\n\n`evicted: false` means there was nothing stored \u2014 not an error."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('reports whether anything was removed', () => {",
+                  "    const b = pm.response.json();",
+                  "    pm.expect(b.success).to.be.true;",
+                  "    pm.expect(b.evicted).to.be.a('boolean');",
+                  "});"
+                ],
+                "packages": {}
+              }
+            }
+          ],
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Operations",
+      "description": "Health, quota, and the endpoints used to recover an upstream session.\n\n**Note on shape:** `/health` and `/healthz` deliberately sit outside the `success`/`data`/`meta` envelope used by the rest of the API. They are probes consumed by orchestrators and monitoring rather than by API clients, and wrapping a liveness probe in an envelope would add a field every probe has to unwrap for no benefit.",
+      "item": [
+        {
+          "name": "Health and remaining quota",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "Service status, dependency health, and remaining quota across all three rate limit tiers.\n\nDeliberately exempt from rate limiting: the endpoint that reports remaining quota has to stay reachable precisely when a caller is being throttled.\n\nTwo fields matter operationally:\n- `pendingChallenges` \u2014 non-empty means the upstream is waiting on a verification code (see the Operations folder).\n- `loginHealth` \u2014 non-empty means automatic re-authentication is failing."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const h = pm.response.json();",
+                  "",
+                  "pm.test('reports status', () => pm.expect(h.status).to.be.oneOf(['ok','degraded']));",
+                  "",
+                  "pm.test('all three rate limit tiers are reported', () => {",
+                  "    pm.expect(h.rateLimits.scrapesPerMinute.limitPerMinute).to.be.a('number');",
+                  "    pm.expect(h.rateLimits.requestsPerMinute.limitPerMinute).to.be.a('number');",
+                  "    pm.expect(h.rateLimits.perClientPerMinute.limitPerMinute).to.be.a('number');",
+                  "});",
+                  "",
+                  "pm.test('remaining fetch budget is exposed at the top level', () =>",
+                  "    pm.expect(h.requestsRemaining).to.be.a('number'));",
+                  "",
+                  "pm.test('operator signals are present', () => {",
+                  "    pm.expect(h.pendingChallenges).to.be.an('array');",
+                  "    pm.expect(h.loginHealth).to.be.an('array');",
+                  "});",
+                  "",
+                  "if (h.pendingChallenges.length) {",
+                  "    console.warn('A verification challenge is awaiting a code \u2014 see Operations \u2192 Submit verification code.');",
+                  "}"
+                ],
+                "packages": {}
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 \u2014 healthy",
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json; charset=utf-8"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"status\": \"ok\",\n  \"uptimeSeconds\": 1303,\n  \"requestsRemaining\": 5,\n  \"rateLimits\": {\n    \"scrapesPerMinute\": {\n      \"limitPerMinute\": 5,\n      \"usedInWindow\": 0,\n      \"remaining\": 5,\n      \"resetInSeconds\": 0\n    },\n    \"requestsPerMinute\": {\n      \"limitPerMinute\": 20,\n      \"usedInWindow\": 12,\n      \"remaining\": 8,\n      \"resetInSeconds\": 22\n    },\n    \"perClientPerMinute\": {\n      \"limitPerMinute\": 10,\n      \"activeClients\": 6\n    }\n  },\n  \"scrapeBudget\": {\n    \"limitPerMinute\": 5,\n    \"usedInWindow\": 0,\n    \"remaining\": 5,\n    \"resetInSeconds\": 0\n  },\n  \"cache\": {\n    \"kind\": \"gcs\",\n    \"healthy\": true\n  },\n  \"browserSessions\": [\n    {\n      \"identity\": \"primary\",\n      \"open\": true,\n      \"ageSeconds\": 1252,\n      \"idleSeconds\": 292\n    }\n  ],\n  \"loginHealth\": [],\n  \"pendingChallenges\": [],\n  \"identities\": [\n    {\n      \"label\": \"primary\",\n      \"state\": \"available\",\n      \"proxy\": \"direct\",\n      \"totalRequests\": 1,\n      \"totalFailures\": 0,\n      \"consecutiveFailures\": 0,\n      \"cooldownSecondsRemaining\": 0\n    }\n  ]\n}"
+            }
+          ]
+        },
+        {
+          "name": "Liveness probe",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/healthz",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            },
+            "description": "Liveness only. Touches no dependency, so an upstream problem cannot cause the platform to recycle an otherwise healthy container. Never rate limited."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('minimal body', () => pm.expect(pm.response.json().status).to.equal('ok'));"
+                ],
+                "packages": {}
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200",
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json; charset=utf-8"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"status\": \"ok\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Submit verification code",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"123456\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/admin/session/challenge",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "session",
+                "challenge"
+              ]
+            },
+            "description": "Completes a pending upstream verification challenge.\n\nLinkedIn challenges an unattended sign-in from an unfamiliar device or network \u2014 which a datacenter address is by definition. A challenge is bound to the browser session that triggered it, so discarding that session and signing in again only produces another challenge. The service therefore holds the browser open and reports the challenge on `/health`; this endpoint delivers the code to it.\n\nThe code arrives by email at the configured account. A mistyped code leaves the challenge open for another attempt; unanswered challenges are reaped after 45 minutes."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    pm.test('challenge cleared and identities released', () => {",
+                  "        const b = pm.response.json();",
+                  "        pm.expect(b.success).to.be.true;",
+                  "        pm.expect(b.account).to.be.a('string');",
+                  "        pm.expect(b.identitiesReleased).to.be.a('number');",
+                  "    });",
+                  "} else {",
+                  "    pm.test('failure is typed and says whether to retry', () => {",
+                  "        const e = pm.response.json().error;",
+                  "        pm.expect(e.code).to.be.a('string');",
+                  "        console.log('verification failed:', e.message);",
+                  "    });",
+                  "}"
+                ],
+                "packages": {}
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 \u2014 cleared",
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json; charset=utf-8"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"success\": true,\n  \"identity\": \"primary\",\n  \"account\": \"Serpico\",\n  \"identitiesReleased\": 1\n}"
+            },
+            {
+              "name": "400 \u2014 malformed code",
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json; charset=utf-8"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"success\": false,\n  \"error\": {\n    \"code\": \"INVALID_URL\",\n    \"message\": \"Body must be {\\\"code\\\":\\\"123456\\\"} \\u2014 a 4 to 8 digit verification code.\"\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "Reset session and clear backoff",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/admin/session/reset",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "session",
+                "reset"
+              ]
+            },
+            "description": "Clears the automatic sign-in circuit breaker, drops live browser sessions, and releases identity backoff, so the next request re-establishes from scratch.\n\nIntended for recovery after corrected configuration: without it, a fixed credential would not take effect until a timeout expired or the service was redeployed."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('reports what it cleared', () => {",
+                  "    const b = pm.response.json();",
+                  "    pm.expect(b.success).to.be.true;",
+                  "    pm.expect(b.cleared).to.be.an('array');",
+                  "    pm.expect(b.identitiesReleased).to.be.a('number');",
+                  "});"
+                ],
+                "packages": {}
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200",
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json; charset=utf-8"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"success\": true,\n  \"cleared\": [\n    \"primary\"\n  ],\n  \"identitiesReleased\": 1\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Reference",
+      "description": "Machine-readable contract and rate limit behaviour.\n\n**Note on shape:** `/docs/json` returns an OpenAPI document, whose shape the specification dictates, so it sits outside the `success`/`data`/`meta` envelope used by the API endpoints.",
+      "item": [
+        {
+          "name": "OpenAPI specification",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/docs/json",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "docs",
+                "json"
+              ]
+            },
+            "description": "The OpenAPI 3.0 document, generated from the same schemas the service validates against \u2014 so the published contract cannot drift from the implementation. Interactive documentation is at `/docs`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const spec = pm.response.json();",
+                  "pm.test('is an OpenAPI 3 document', () => pm.expect(spec.openapi).to.match(/^3\\./));",
+                  "pm.test('documents the profile endpoint', () =>",
+                  "    pm.expect(spec.paths).to.have.property('/v1/profile'));"
+                ],
+                "packages": {}
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "Demonstrate the per-caller rate limit (429)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/profile?url=https://www.linkedin.com/company/x",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "profile"
+              ],
+              "query": [
+                {
+                  "key": "url",
+                  "value": "https://www.linkedin.com/company/x"
+                }
+              ]
+            },
+            "description": "Run this repeatedly (Postman's Runner with 12+ iterations) to observe the per-caller limit.\n\nThe first 10 requests in any 60-second window return 400 \u2014 the URL is deliberately invalid, so nothing is fetched \u2014 and the 11th returns 429 with a `retry-after` header.\n\nThis exercises the limiter without consuming any fetch budget, because an invalid URL never reaches LinkedIn."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('either the typed rejection or the rate limit', () =>",
+                  "    pm.expect(pm.response.code).to.be.oneOf([400, 429]));",
+                  "",
+                  "if (pm.response.code === 429) {",
+                  "    const body = pm.response.json();",
+                  "    pm.test('429 identifies which limit was hit', () => {",
+                  "        pm.expect(body.error.code).to.equal('RATE_LIMITED');",
+                  "        pm.expect(body.error.details.scope).to.be.oneOf(['client', 'service']);",
+                  "    });",
+                  "    pm.test('429 tells the caller exactly how long to wait', () => {",
+                  "        pm.expect(pm.response.headers.get('retry-after')).to.be.a('string');",
+                  "        pm.expect(body.error.retryAfterSeconds).to.be.a('number');",
+                  "    });",
+                  "}"
+                ],
+                "packages": {}
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "429 \u2014 per-caller limit",
+              "status": "Too Many Requests",
+              "code": 429,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json; charset=utf-8"
+                },
+                {
+                  "key": "retry-after",
+                  "value": "53"
+                }
+              ],
+              "cookie": [],
+              "body": "{\n  \"success\": false,\n  \"error\": {\n    \"code\": \"RATE_LIMITED\",\n    \"message\": \"Too many requests from this client. Slow down and retry.\",\n    \"details\": {\n      \"scope\": \"client\"\n    },\n    \"retryAfterSeconds\": 53\n  }\n}"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "packages": {},
+        "exec": [
+          "// A live fetch can legitimately take several seconds; a short default",
+          "// timeout would report a working service as broken.",
+          "pm.request.timeout = 60000;"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "packages": {},
+        "exec": [
+          "// Applies to every request in the collection.",
+          "pm.test('responds with JSON', () =>",
+          "    pm.expect(pm.response.headers.get('Content-Type') || '').to.include('application/json'));",
+          "",
+          "// The success/data/meta envelope is the API contract, and these paths sit",
+          "// outside it by design:",
+          "//   /health, /healthz  probes for orchestrators and monitoring, not API",
+          "//                      clients \u2014 an envelope would add a field every probe",
+          "//                      has to unwrap for no benefit",
+          "//   /docs/json         an OpenAPI document, whose shape the spec dictates",
+          "const path = pm.request.url.getPath();",
+          "const outsideEnvelope = /^\\/healthz?$/.test(path) || path.startsWith('/docs');",
+          "",
+          "if (!outsideEnvelope) {",
+          "    pm.test('carries the success discriminator', () =>",
+          "        pm.expect(pm.response.json()).to.have.property('success'));",
+          "}",
+          "",
+          "// Any 429 must tell the caller how long to wait \u2014 otherwise a client can only",
+          "// guess, and guessing is how a limiter turns into a retry storm.",
+          "if (pm.response.code === 429) {",
+          "    pm.test('429 carries retry-after', () =>",
+          "        pm.expect(pm.response.headers.get('retry-after')).to.be.a('string'));",
+          "}"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "publicId",
+      "value": "williamhgates",
+      "description": "Path variable for the cache-eviction request."
+    },
+    {
+      "key": "lastPublicId",
+      "value": "",
+      "description": "Set by the profile test script, for chaining."
+    }
+  ]
+}
