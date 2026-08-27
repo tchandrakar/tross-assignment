@@ -77,6 +77,25 @@ Service status, dependency health, and remaining quota across all three rate
 limit tiers. Never rate limited — the endpoint that reports remaining quota must
 stay reachable precisely when a caller is being throttled.
 
+### `POST /v1/admin/session/challenge`
+
+```json
+{ "code": "123456" }
+```
+
+Submits a verification code for a pending upstream challenge.
+
+LinkedIn challenges an unattended sign-in from an unfamiliar device or network,
+and a challenge is bound to the browser session that triggered it — closing that
+session and signing in again simply produces another challenge. The service
+therefore holds the browser open and reports the pending challenge on
+`/health`; this endpoint delivers the code to it, so authentication completes
+without anyone needing access to the browser. On success the resulting session
+is stored and the service is authenticated again with no further action.
+
+A mistyped code leaves the challenge open so it can be retried. Unanswered
+challenges are reaped after 20 minutes.
+
 ### `POST /v1/admin/session/reset`
 
 Clears the automatic-login circuit breaker and drops live browser sessions, so
@@ -256,9 +275,12 @@ These hold everywhere in the response, and each exists for a reason:
 | `UPSTREAM_BLOCKED` | 503 | LinkedIn rejected the request | Retry after `retryAfterSeconds` |
 | `NO_IDENTITY_AVAILABLE` | 503 | All upstream identities are cooling down or quarantined | Retry later |
 
-`GET /health` reports `loginHealth`. A non-empty array means automatic
-re-authentication is failing; `suspended: true` means the circuit breaker has
-tripped and operator action is required.
+`GET /health` reports two operator-facing fields:
+
+- **`loginHealth`** — non-empty means automatic re-authentication is failing.
+  `suspended: true` means the circuit breaker has tripped.
+- **`pendingChallenges`** — non-empty means the upstream is waiting on a
+  verification code. Submit it to `POST /v1/admin/session/challenge`.
 
 ---
 
@@ -743,12 +765,16 @@ the API.
   stale-replay failure described above, self-inflicted. This was observed
   directly during development when a local process and the deployed instance
   shared one session.
-- **Sessions occasionally need manual re-establishment.** Persistence follows
-  token rotation, but a password change, a sign-out elsewhere, or a security
-  challenge still ends a session. Automatic re-authentication is attempted, and
-  suspended by the circuit breaker if it fails, because unattended
-  re-authentication is challenge-prone by nature. `GET /health` reports when
-  operator action is required.
+- **Unattended sign-in can be challenged.** Automatic re-authentication works,
+  and is the normal recovery path — but the upstream challenges sign-ins from
+  unfamiliar devices and networks, which a datacenter address is by definition.
+  When that happens the service holds the browser open and reports it on
+  `/health`, so the challenge is completed by posting the code to
+  `POST /v1/admin/session/challenge` rather than by anyone touching the browser.
+  A CAPTCHA challenge cannot be answered this way and needs `npm run login`.
+  A circuit breaker suspends automatic sign-in after repeated failures, because
+  retrying a rejected credential cannot succeed and moves the account towards a
+  lockout.
 - **Cold start is slow.** The first request after a restart pays roughly 5–10
   seconds to launch Chromium and establish the page; subsequent requests are
   1–5 seconds. Measured: 9.9s cold, 4.8s warm.

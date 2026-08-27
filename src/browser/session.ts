@@ -5,7 +5,7 @@ import { ApiError } from '../errors.js';
 import type { Identity } from '../identity/pool.js';
 import type { SessionStore, StorageState } from './session-store.js';
 import { NullSessionStore } from './session-store.js';
-import { LoginChallengeError, performLogin } from './login.js';
+import { abandonChallenge, completeChallenge, performLogin, type ChallengeHandle } from './login.js';
 
 /**
  * A long-lived, logged-in Chromium session per identity.
@@ -53,6 +53,9 @@ const MAX_LOGIN_FAILURES = 3;
 
 /** How long automatic login stays suspended after tripping the breaker. */
 const LOGIN_BLOCK_MS = 30 * 60_000;
+
+/** How long an unanswered challenge holds its browser open before being reaped. */
+const CHALLENGE_TTL_MS = 20 * 60_000;
 
 /**
  * Runs in the page. Confirms the session against the API rather than the DOM —
@@ -111,6 +114,16 @@ export class BrowserSession {
    * service stops trying and reports what a human needs to do.
    */
   private readonly loginFailures = new Map<string, { count: number; lastError: string; blockedUntil: number }>();
+
+  /**
+   * Challenges LinkedIn has issued and that are waiting on a verification code.
+   *
+   * The browser stays open while a challenge is pending, because the challenge
+   * is bound to that browser session — closing it and logging in again would
+   * simply produce a new challenge. A TTL reaps handles nobody answers, so an
+   * unanswered challenge cannot leak a Chromium process indefinitely.
+   */
+  private readonly pendingChallenges = new Map<string, { handle: ChallengeHandle; url: string; kind: string; reaper: NodeJS.Timeout }>();
   private closed = false;
 
   constructor(
@@ -345,7 +358,7 @@ export class BrowserSession {
     const attempt = (async () => {
       this.logger.info({ identity: identity.label }, 'no usable session — attempting automatic login');
 
-      const { firstName, state } = await performLogin({
+      const result = await performLogin({
         email: this.credentials!.email,
         password: this.credentials!.password,
         interactive: false,
@@ -354,10 +367,29 @@ export class BrowserSession {
         log: (message) => { if (message) this.logger.debug({ identity: identity.label }, message); },
       });
 
-      await this.store.save(identity.id, state as StorageState);
+      if (result.status === 'challenge') {
+        this.registerChallenge(identity, result.handle, result.challengeUrl, result.kind);
+        throw new ApiError(
+          'AUTH_FAILED',
+          `LinkedIn issued a ${result.kind === 'captcha' ? 'CAPTCHA' : 'verification code'} challenge for identity "${identity.label}". ` +
+            (result.kind === 'captcha'
+              ? 'A CAPTCHA cannot be answered through the API — run `npm run login` and upload the session.'
+              : 'The browser is held open awaiting the code. Submit it to POST /v1/admin/session/challenge with {"code":"123456"}.'),
+          {
+            details: {
+              identity: identity.label,
+              challenge: result.kind,
+              awaitingCode: result.kind !== 'captcha',
+              needsHuman: true,
+            },
+          },
+        );
+      }
+
+      await this.store.save(identity.id, result.state as StorageState);
       this.loginFailures.delete(identity.id);
-      this.logger.info({ identity: identity.label, account: firstName }, 'automatic login succeeded; session stored');
-      return state as StorageState;
+      this.logger.info({ identity: identity.label, account: result.firstName }, 'automatic login succeeded; session stored');
+      return result.state as StorageState;
     })().finally(() => this.logins.delete(identity.id));
 
     this.logins.set(identity.id, attempt);
@@ -365,6 +397,11 @@ export class BrowserSession {
     try {
       return await attempt;
     } catch (error) {
+      // A challenge means the credentials were accepted and LinkedIn wants
+      // verification. Counting it as a login failure would trip the breaker and
+      // block the very retry that submitting the code enables.
+      if (error instanceof ApiError && error.details?.challenge) throw error;
+
       const message = (error as Error).message ?? String(error);
       const previous = this.loginFailures.get(identity.id)?.count ?? 0;
       const count = previous + 1;
@@ -397,12 +434,6 @@ export class BrowserSession {
         );
       }
 
-      if (error instanceof LoginChallengeError) {
-        throw new ApiError('AUTH_FAILED', error.message, {
-          cause: error,
-          details: { identity: identity.label, needsHuman: true },
-        });
-      }
       throw new ApiError(
         'AUTH_FAILED',
         `Automatic login failed for identity "${identity.label}": ${(error as Error).message}`,
@@ -570,11 +601,80 @@ export class BrowserSession {
    * recovery would mean either waiting out the breaker or redeploying — both
    * poor answers to "the password is corrected, try again".
    */
+  private registerChallenge(identity: Identity, handle: ChallengeHandle, url: string, kind: string): void {
+    void this.discardChallenge(identity.id);
+
+    const reaper = setTimeout(() => { void this.discardChallenge(identity.id); }, CHALLENGE_TTL_MS);
+    reaper.unref?.();
+
+    this.pendingChallenges.set(identity.id, { handle, url, kind, reaper });
+    this.logger.warn({ identity: identity.label, kind, url }, 'verification challenge pending — awaiting a code');
+  }
+
+  private async discardChallenge(identityId: string): Promise<void> {
+    const pending = this.pendingChallenges.get(identityId);
+    if (!pending) return;
+    this.pendingChallenges.delete(identityId);
+    clearTimeout(pending.reaper);
+    await abandonChallenge(pending.handle);
+  }
+
+  /**
+   * Submits a verification code into a pending challenge. On success the
+   * resulting session is stored and the service is authenticated again with no
+   * further action.
+   */
+  async submitChallengeCode(code: string, identityId?: string): Promise<{ identity: string; account: string | null }> {
+    const id = identityId ?? [...this.pendingChallenges.keys()][0];
+    const pending = id ? this.pendingChallenges.get(id) : undefined;
+
+    if (!id || !pending) {
+      throw new ApiError('AUTH_FAILED', 'There is no verification challenge awaiting a code.', {
+        details: { pending: [...this.pendingChallenges.keys()] },
+      });
+    }
+
+    try {
+      const { firstName, state } = await completeChallenge(pending.handle, code);
+      await this.store.save(id, state as StorageState);
+      this.loginFailures.delete(id);
+
+      // The challenge browser has done its job; the live session is rebuilt
+      // from the stored state on the next request.
+      this.pendingChallenges.delete(id);
+      clearTimeout(pending.reaper);
+      await abandonChallenge(pending.handle);
+      await this.dispose(id);
+
+      this.logger.info({ identity: id, account: firstName }, 'verification challenge cleared; session stored');
+      return { identity: id, account: firstName };
+    } catch (error) {
+      // Left open deliberately: LinkedIn allows several attempts, and a fresh
+      // login would only issue a fresh challenge.
+      throw new ApiError('AUTH_FAILED', `Verification failed: ${(error as Error).message}`, {
+        cause: error,
+        details: { identity: id, retryable: true },
+      });
+    }
+  }
+
+  /** Pending challenges, for the health endpoint. */
+  challenges(): Array<{ identity: string; kind: string; url: string; waitingSeconds: number }> {
+    const now = Date.now();
+    return [...this.pendingChallenges.entries()].map(([identity, c]) => ({
+      identity,
+      kind: c.kind,
+      url: c.url,
+      waitingSeconds: Math.floor((now - c.handle.openedAt) / 1000),
+    }));
+  }
+
   async resetLoginBreaker(identity?: Identity): Promise<{ cleared: string[] }> {
     const targets = identity ? [identity.id] : [...new Set([...this.loginFailures.keys(), ...this.sessions.keys()])];
 
     for (const id of targets) {
       this.loginFailures.delete(id);
+      await this.discardChallenge(id);
       await this.dispose(id);
     }
 
@@ -605,6 +705,7 @@ export class BrowserSession {
 
   async close(): Promise<void> {
     this.closed = true;
+    for (const id of [...this.pendingChallenges.keys()]) await this.discardChallenge(id);
     for (const id of [...this.sessions.keys()]) await this.dispose(id);
   }
 }

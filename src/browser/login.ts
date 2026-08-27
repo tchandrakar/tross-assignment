@@ -1,4 +1,4 @@
-import { chromium, type Locator, type Page } from 'playwright';
+import { chromium, type Browser, type BrowserContext, type Locator, type Page } from 'playwright';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { mkdir } from 'node:fs/promises';
 import { getConfig } from '../config.js';
@@ -149,10 +149,33 @@ export interface LoginOptions {
   log?: (message: string) => void;
 }
 
-export interface LoginResult {
+export interface LoginSuccess {
+  status: 'success';
   firstName: string | null;
   state: unknown;
 }
+
+/**
+ * LinkedIn issued a verification challenge and the browser has been left open
+ * so it can be completed. The caller owns these handles and must eventually
+ * call `completeChallenge` or `abandonChallenge` — otherwise the browser leaks.
+ */
+export interface LoginChallenge {
+  status: 'challenge';
+  challengeUrl: string;
+  /** What the page is asking for, as far as we can tell. */
+  kind: 'code' | 'captcha' | 'unknown';
+  handle: ChallengeHandle;
+}
+
+export interface ChallengeHandle {
+  browser: Browser;
+  context: BrowserContext;
+  page: Page;
+  openedAt: number;
+}
+
+export type LoginResult = LoginSuccess | LoginChallenge;
 
 /**
  * Performs the login and returns the resulting storage state. Shared by the
@@ -184,6 +207,9 @@ export async function performLogin(options: LoginOptions): Promise<LoginResult> 
   });
 
   const page = await context.newPage();
+  // When a challenge is handed back, the caller owns the browser — the finally
+  // block must not close it out from under them.
+  let challengeIssued = false;
 
   try {
     log('opening LinkedIn login');
@@ -195,7 +221,7 @@ export async function performLogin(options: LoginOptions): Promise<LoginResult> 
       const existing = await whoAmI(page);
       if (existing.status === 200) {
         log(`already signed in as ${existing.firstName ?? '(unknown)'}`);
-        return { firstName: existing.firstName, state: await context.storageState() };
+        return { status: 'success', firstName: existing.firstName, state: await context.storageState() };
       }
     }
 
@@ -217,13 +243,15 @@ export async function performLogin(options: LoginOptions): Promise<LoginResult> 
 
     if (CHALLENGE_MARKERS.some((marker) => page.url().includes(marker))) {
       if (!interactive) {
-        // Nobody is watching on a server. Fail clearly rather than hanging for
-        // five minutes on a challenge that will never be answered.
+        // Nobody is at the browser, but the challenge is still answerable: keep
+        // the context alive and hand it back so a code can be submitted through
+        // the API. Closing here would discard the only session that can
+        // complete it, forcing a fresh login and a fresh challenge.
+        const kind = await classifyChallenge(page);
         if (shotPath) await page.screenshot({ path: shotPath }).catch(() => undefined);
-        throw new LoginChallengeError(
-          `LinkedIn presented a verification challenge (${page.url()}) and no human is available to clear it. ` +
-            'Run `npm run login` locally and upload the resulting session.',
-        );
+        log(`verification challenge (${kind}) at ${page.url()}`);
+        challengeIssued = true;
+        return { status: 'challenge', challengeUrl: page.url(), kind, handle: { browser, context, page, openedAt: Date.now() } };
       }
 
       log('');
@@ -248,14 +276,97 @@ export async function performLogin(options: LoginOptions): Promise<LoginResult> 
     }
 
     log(`logged in as ${me.firstName ?? '(unknown)'}`);
-    return { firstName: me.firstName, state: await context.storageState() };
+    return { status: 'success', firstName: me.firstName, state: await context.storageState() };
   } catch (error) {
     if (shotPath) await page.screenshot({ path: shotPath, fullPage: false }).catch(() => undefined);
     throw error;
   } finally {
-    await context.close().catch(() => undefined);
-    await browser.close().catch(() => undefined);
+    if (!challengeIssued) {
+      await context.close().catch(() => undefined);
+      await browser.close().catch(() => undefined);
+    }
   }
+}
+
+/** Inputs LinkedIn uses for a one-time verification code, in priority order. */
+const CODE_SELECTORS = [
+  'input[autocomplete="one-time-code"]',
+  'input[name="pin"]',
+  '#input__email_verification_pin',
+  'input[inputmode="numeric"]',
+  'input[type="tel"]',
+  'input[type="text"]:not([type="hidden"])',
+];
+
+async function classifyChallenge(page: Page): Promise<'code' | 'captcha' | 'unknown'> {
+  try {
+    const text = await page.evaluate(() => (document.body.innerText || '').slice(0, 2000));
+    if (/verification code|enter the code|we sent|check your email|two-step/i.test(text)) return 'code';
+    if (/captcha|puzzle|verify you.?re human|security check/i.test(text)) return 'captcha';
+  } catch {
+    // Fall through to unknown.
+  }
+  return 'unknown';
+}
+
+/**
+ * Submits a verification code into an open challenge and finishes the login.
+ *
+ * Returns the storage state on success. Leaves the handle open on failure so a
+ * mistyped code can be retried without restarting the whole login — LinkedIn
+ * allows several attempts, but a fresh login would issue a fresh challenge.
+ */
+export async function completeChallenge(
+  handle: ChallengeHandle,
+  code: string,
+): Promise<{ firstName: string | null; state: unknown }> {
+  const { page } = handle;
+
+  let field: Locator | null = null;
+  for (const selector of CODE_SELECTORS) {
+    const locator = page.locator(`${selector}:visible`).first();
+    if ((await locator.count()) > 0) { field = locator; break; }
+  }
+  if (!field) {
+    throw new Error(
+      `No verification-code input found on ${page.url()}. The challenge is probably a CAPTCHA, which cannot be answered through the API.`,
+    );
+  }
+
+  await field.click();
+  await field.fill('');
+  for (const char of code.trim()) {
+    await field.pressSequentially(char, { delay: 60 + Math.random() * 90 });
+  }
+  await sleep(400);
+
+  const submit = page.getByRole('button', { name: /submit|verify|continue|next/i }).filter({ visible: true }).first();
+  if ((await submit.count()) > 0) {
+    await submit.click();
+  } else {
+    await page.keyboard.press('Enter');
+  }
+
+  await page.waitForLoadState('domcontentloaded').catch(() => undefined);
+  await sleep(4_000);
+
+  if (CHALLENGE_MARKERS.some((marker) => page.url().includes(marker))) {
+    const text = await page.evaluate(() => (document.body.innerText || '').slice(0, 400)).catch(() => '');
+    throw new Error(`Still on the challenge page after submitting the code. LinkedIn says: ${text.replace(/\s+/g, ' ').slice(0, 200)}`);
+  }
+
+  const me = await whoAmI(page);
+  if (me.status !== 200) {
+    throw new Error(`Challenge submitted but the session is still not authenticated (me returned ${me.status}).`);
+  }
+
+  return { firstName: me.firstName, state: await handle.context.storageState() };
+}
+
+/** Releases a challenge's browser without completing it. */
+export async function abandonChallenge(handle: ChallengeHandle): Promise<void> {
+  await handle.context.close().catch(() => undefined);
+  await handle.browser.close().catch(() => undefined);
 }
 
 /** Distinguishes "needs a human" from "credentials are wrong". */
@@ -279,7 +390,7 @@ export async function runLogin(): Promise<void> {
   const store = new FileSessionStore(config.sessionStateDir);
   await mkdir(config.sessionStateDir, { recursive: true });
 
-  const { firstName, state } = await performLogin({
+  const result = await performLogin({
     email: config.loginEmail,
     password: config.loginPassword,
     interactive: true,
@@ -287,6 +398,14 @@ export async function runLogin(): Promise<void> {
     log: (m) => console.log(m ? `→ ${m}` : ''),
   });
 
+  // Interactive runs wait at the challenge in the visible browser, so reaching
+  // here with a challenge result should not happen — handled for completeness.
+  if (result.status === 'challenge') {
+    await abandonChallenge(result.handle);
+    throw new Error(`Login stopped at a verification challenge: ${result.challengeUrl}`);
+  }
+
+  const { firstName, state } = result;
   await store.save(identityId, state as never);
 
   console.log('');

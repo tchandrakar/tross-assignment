@@ -86,26 +86,38 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Publish the LinkedIn session to the bucket
-        # The session is the one credential the running service needs. It lives
-        # in GCS behind IAM rather than on the VM disk, so a rebuilt VM comes
-        # back authenticated without a human re-running the login helper.
+      - name: Seed the LinkedIn session if the bucket has none
+        # LI_SESSION_STATE is a BOOTSTRAP SEED, not the source of truth.
+        #
+        # The running service rotates its session token continuously and writes
+        # the current value back to the bucket. Overwriting that on every deploy
+        # would replace a live session with a stale snapshot and force a fresh
+        # login — which is the most challenge-prone thing the service does. So
+        # the seed is only written when the bucket has no session at all.
         env:
           SESSION_STATE: ${{ secrets.LI_SESSION_STATE }}
         run: |
-          if [ -n "$SESSION_STATE" ]; then
-            printf '%s' "$SESSION_STATE" > /tmp/session.json
-            if ! python3 -c 'import json,sys; json.load(open("/tmp/session.json"))'; then
-              echo "::error::LI_SESSION_STATE is not valid JSON — refusing to publish it."
-              exit 1
-            fi
-            gcloud storage cp /tmp/session.json \
-              "gs://${{ secrets.GCS_BUCKET }}/sessions/${{ secrets.SESSION_IDENTITIES }}.json" --quiet
-            shred -u /tmp/session.json || rm -f /tmp/session.json
-            echo "session published"
-          else
-            echo "::warning::LI_SESSION_STATE is unset — the service will have no session until one is uploaded."
+          TARGET="gs://${{ secrets.GCS_BUCKET }}/sessions/${{ secrets.SESSION_IDENTITIES }}.json"
+
+          if gcloud storage ls "$TARGET" >/dev/null 2>&1; then
+            echo "A session already exists at $TARGET — leaving it untouched."
+            exit 0
           fi
+
+          if [ -z "$SESSION_STATE" ]; then
+            echo "::warning::No session in the bucket and LI_SESSION_STATE is unset. The service will attempt an automatic login on first use."
+            exit 0
+          fi
+
+          printf '%s' "$SESSION_STATE" > /tmp/session.json
+          if ! python3 -c 'import json,sys; d=json.load(open("/tmp/session.json")); sys.exit(0 if d.get("cookies") else 1)'; then
+            echo "::error::LI_SESSION_STATE is not a valid storage state — refusing to publish it."
+            exit 1
+          fi
+
+          gcloud storage cp /tmp/session.json "$TARGET" --quiet
+          shred -u /tmp/session.json || rm -f /tmp/session.json
+          echo "Seeded $TARGET"
 
       - name: Render deployment files
         run: |
