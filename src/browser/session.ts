@@ -48,6 +48,25 @@ const UA =
  */
 const KEEPALIVE_INTERVAL_MS = 8 * 60_000;
 
+/**
+ * Runs in the page. Confirms the session against the API rather than the DOM —
+ * LinkedIn serves a guest-rendered page to an unauthenticated navigation while
+ * `fetch()` from the same origin still authenticates, so the DOM genuinely
+ * cannot tell you whether you are logged in.
+ */
+const meProbe = async (): Promise<number> => {
+  const csrf = (document.cookie.match(/JSESSIONID="?([^";]+)"?/)?.[1] ?? '').replace(/"/g, '');
+  const response = await fetch('/voyager/api/me', {
+    credentials: 'include',
+    headers: {
+      accept: 'application/vnd.linkedin.normalized+json+2.1',
+      'csrf-token': csrf,
+      'x-restli-protocol-version': '2.0.0',
+    },
+  });
+  return response.status;
+};
+
 /** Landing page for establishing a session when the caller has no target. */
 const DEFAULT_LANDING = 'https://www.linkedin.com/mynetwork/';
 
@@ -224,18 +243,7 @@ export class BrowserSession {
    * tell you whether you are logged in — `/voyager/api/me` can.
    */
   private async assertAuthenticated(identity: Identity, page: Page, context: BrowserContext): Promise<void> {
-    const status = await page.evaluate(async () => {
-      const csrf = (document.cookie.match(/JSESSIONID="?([^";]+)"?/)?.[1] ?? '').replace(/"/g, '');
-      const response = await fetch('/voyager/api/me', {
-        credentials: 'include',
-        headers: {
-          accept: 'application/vnd.linkedin.normalized+json+2.1',
-          'csrf-token': csrf,
-          'x-restli-protocol-version': '2.0.0',
-        },
-      });
-      return response.status;
-    });
+    const status = await evaluateSettled(page, meProbe, null);
 
     if (status === 200) return;
 
@@ -248,14 +256,7 @@ export class BrowserSession {
     await context.addCookies(state.cookies as never);
     await this.navigate(identity, page, DEFAULT_LANDING);
 
-    const recheck = await page.evaluate(async () => {
-      const csrf = (document.cookie.match(/JSESSIONID="?([^";]+)"?/)?.[1] ?? '').replace(/"/g, '');
-      const response = await fetch('/voyager/api/me', {
-        credentials: 'include',
-        headers: { accept: 'application/vnd.linkedin.normalized+json+2.1', 'csrf-token': csrf, 'x-restli-protocol-version': '2.0.0' },
-      });
-      return response.status;
-    });
+    const recheck = await evaluateSettled(page, meProbe, null);
 
     if (recheck !== 200) {
       throw new ApiError('AUTH_FAILED', `Identity "${identity.label}" could not be authenticated (me returned ${recheck}).`);
@@ -273,14 +274,7 @@ export class BrowserSession {
     if (Date.now() - live.lastTouchedAt < KEEPALIVE_INTERVAL_MS) return;
 
     try {
-      const status = await live.page.evaluate(async () => {
-        const csrf = (document.cookie.match(/JSESSIONID="?([^";]+)"?/)?.[1] ?? '').replace(/"/g, '');
-        const response = await fetch('/voyager/api/me', {
-          credentials: 'include',
-          headers: { accept: 'application/vnd.linkedin.normalized+json+2.1', 'csrf-token': csrf, 'x-restli-protocol-version': '2.0.0' },
-        });
-        return response.status;
-      });
+      const status = await evaluateSettled(live.page, meProbe, null);
 
       live.lastTouchedAt = Date.now();
       await this.persist(identity, live.context);
@@ -378,7 +372,7 @@ export class BrowserSession {
 
     const url = path.startsWith('http') ? path : `https://www.linkedin.com/voyager/api${path}`;
 
-    const result = await live.page.evaluate(async (target: string): Promise<InPageResponse> => {
+    const result = await evaluateSettled(live.page, async (target: string): Promise<InPageResponse> => {
       const csrf = (document.cookie.match(/JSESSIONID="?([^";]+)"?/)?.[1] ?? '').replace(/"/g, '');
 
       const response = await fetch(target, {
@@ -464,10 +458,13 @@ export class BrowserSession {
       await this.navigate(identity, live.page, profileUrl);
       await live.page.waitForTimeout(3_000);
 
-      const inline = await live.page.evaluate(() =>
-        Array.from(document.querySelectorAll('code[id^="bpr-guid-"]'))
-          .map((node) => node.textContent ?? '')
-          .filter((text) => text.includes('"data"') || text.includes('"included"')),
+      const inline = await evaluateSettled(
+        live.page,
+        () =>
+          Array.from(document.querySelectorAll('code[id^="bpr-guid-"]'))
+            .map((node) => node.textContent ?? '')
+            .filter((text) => text.includes('"data"') || text.includes('"included"')),
+        null,
       );
 
       for (const text of inline) {
@@ -519,6 +516,40 @@ export class BrowserSession {
     this.closed = true;
     for (const id of [...this.sessions.keys()]) await this.dispose(id);
   }
+}
+
+/**
+ * `page.evaluate` throws "Execution context was destroyed" when the page
+ * navigates mid-evaluation. That is routine here, not exceptional: LinkedIn
+ * redirects stale vanity names to a member's current one, and its SPA performs
+ * client-side navigations after load. Both destroy the execution context the
+ * evaluation was scheduled in.
+ *
+ * So wait for the page to settle and try again rather than failing the request.
+ */
+async function evaluateSettled<T, A>(page: Page, fn: (arg: A) => T | Promise<T>, arg: A, attempts = 3): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      // Playwright's Unboxed<A> generic cannot see through this wrapper's own
+      // type parameter; the runtime contract is unchanged.
+      return (await page.evaluate(fn as never, arg as never)) as T;
+    } catch (error) {
+      lastError = error;
+      const message = String((error as Error).message ?? '');
+      const navigated =
+        message.includes('Execution context was destroyed') ||
+        message.includes('Target closed') ||
+        message.includes('navigating and changing');
+      if (!navigated) throw error;
+
+      await page.waitForLoadState('domcontentloaded', { timeout: 30_000 }).catch(() => undefined);
+      await page.waitForTimeout(700 * (attempt + 1));
+    }
+  }
+
+  throw lastError;
 }
 
 function isValidTimezone(tz: string): boolean {

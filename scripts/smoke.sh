@@ -8,13 +8,31 @@ set -Eeuo pipefail
 
 BASE="${1:?usage: smoke.sh <base-url> [profile-url]}"
 PROFILE="${2:-https://www.linkedin.com/in/williamhgates/}"
+# Expanded as "${AUTH[@]:-}" everywhere: under `set -u`, bash 3.2 (still the
+# default on macOS) treats "${AUTH[@]}" on an empty array as an unbound
+# variable and aborts.
 AUTH=()
-[[ -n "${API_KEY:-}" ]] && AUTH=(-H "x-api-key: ${API_KEY}")
+if [[ -n "${API_KEY:-}" ]]; then AUTH=(-H "x-api-key: ${API_KEY}"); fi
+auth_args() { if [[ ${#AUTH[@]} -gt 0 ]]; then printf '%s\n' "${AUTH[@]}"; fi; }
 
 pass() { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
-code() { curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$@"; }
+code() {
+  if [[ ${#AUTH[@]} -gt 0 ]]; then
+    curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$@"
+  else
+    curl -s -o /dev/null -w '%{http_code}' "$@"
+  fi
+}
+
+get() {
+  if [[ ${#AUTH[@]} -gt 0 ]]; then
+    curl -s "${AUTH[@]}" "$@"
+  else
+    curl -s "$@"
+  fi
+}
 
 [[ "$(code "${BASE}/healthz")" == "200" ]] || fail "liveness probe failed"
 pass "liveness"
@@ -34,26 +52,40 @@ pass "rejects missing url"
 
 echo
 echo "Fetching ${PROFILE} …"
-RESPONSE="$(curl -s "${AUTH[@]}" --get --data-urlencode "url=${PROFILE}" "${BASE}/v1/profile")"
+RESPONSE="$(get --max-time 240 --get --data-urlencode "url=${PROFILE}" "${BASE}/v1/profile")"
 echo "$RESPONSE" | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
 if not d.get("success"):
-    print("  error:", json.dumps(d.get("error"), indent=2)); sys.exit(1)
+    print("  error:", json.dumps(d.get("error"), indent=2))
+    sys.exit(1)
 p, m = d["data"], d["meta"]
-print(f"  name:        {p.get(\"fullName\")}")
-print(f"  headline:    {(p.get(\"headline\") or \"\")[:70]}")
-print(f"  location:    {p[\"location\"].get(\"full\")}")
-print(f"  experience:  {len(p[\"experience\"])} entries")
-print(f"  education:   {len(p[\"education\"])} entries")
-print(f"  skills:      {len(p[\"skills\"])}")
-print(f"  source:      {m[\"source\"]}  cached={m[\"cached\"]}  {m[\"durationMs\"]}ms")
+rows = [
+    ("name",        p.get("fullName")),
+    ("headline",    (p.get("headline") or "")[:70]),
+    ("location",    p["location"].get("full")),
+    ("experience",  "{} entries".format(len(p["experience"]))),
+    ("education",   "{} entries".format(len(p["education"]))),
+    ("skills",      len(p["skills"])),
+    ("certs",       len(p["certifications"])),
+    ("languages",   len(p["languages"])),
+    ("images",      "profile={} background={}".format(bool(p["profilePicture"]), bool(p["backgroundImage"]))),
+    ("source",      "{} cached={} {}ms".format(m["source"], m["cached"], m["durationMs"])),
+]
+for k, v in rows:
+    print("  {:<12} {}".format(k + ":", v))
 ' || fail "profile fetch failed"
 pass "profile fetch"
 
 echo
 echo "Re-fetching to confirm the cache serves it …"
-curl -s "${AUTH[@]}" --get --data-urlencode "url=${PROFILE}" "${BASE}/v1/profile" \
-  | python3 -c 'import sys,json; m=json.load(sys.stdin)["meta"]; assert m["cached"], "second request was not a cache hit"; print(f"  cached={m[\"cached\"]} age={m[\"ageSeconds\"]}s {m[\"durationMs\"]}ms")' \
-  || fail "cache did not serve the repeat request"
+get --max-time 120 --get --data-urlencode "url=${PROFILE}" "${BASE}/v1/profile" \
+  | python3 -c '
+import sys, json
+m = json.load(sys.stdin)["meta"]
+if not m["cached"]:
+    print("  second request was NOT a cache hit:", json.dumps(m))
+    sys.exit(1)
+print("  cached={} age={}s {}ms".format(m["cached"], m["ageSeconds"], m["durationMs"]))
+' || fail "cache did not serve the repeat request"
 pass "cache hit on repeat request"
