@@ -71,7 +71,7 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
       : null;
 
   const browserSession = config.enableBrowserFallback
-    ? new BrowserSession(app.log, sessionStore, credentials)
+    ? new BrowserSession(app.log, sessionStore, credentials, config.browserProfileDir)
     : null;
   const scraper = new ProfileScraper(pool, app.log, browserSession, config.enableHttpTransport);
   const service = new ProfileService(scraper, cache, limiter, config, app.log);
@@ -85,7 +85,7 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
   });
   await app.register(swaggerUi, { routePrefix: '/docs', uiConfig: { docExpansion: 'list' } });
 
-  registerHealthRoutes(app, { pool, cache, limiter, startedAt });
+  registerHealthRoutes(app, { pool, cache, limiter, startedAt, browserSession });
   registerProfileRoutes(app, service);
 
   if (!browserSession && !config.enableHttpTransport) {

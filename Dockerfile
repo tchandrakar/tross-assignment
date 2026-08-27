@@ -30,7 +30,11 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/package.json ./package.json
 
-# The base image ships a non-root `pwuser`; Cloud Run has no reason to run as root.
+# Created before dropping privileges so the mounted volume is writable by the
+# app user — the browser profile and session state both live here.
+RUN mkdir -p /app/.sessions/profiles && chown -R pwuser:pwuser /app/.sessions
+
+# The base image ships a non-root `pwuser`; there is no reason to run as root.
 USER pwuser
 
 EXPOSE 8080

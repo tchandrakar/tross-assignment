@@ -61,6 +61,13 @@ const envSchema = z.object({
   GCS_BUCKET: z.string().default(''),
   GCS_PREFIX: z.string().default('profiles/'),
   SESSION_STATE_DIR: z.string().default('.sessions'),
+  /**
+   * Root for persistent Chromium profile directories, one per identity. Keeping
+   * a real browser profile on disk is what lets LinkedIn recognise the device
+   * across restarts — and therefore what avoids re-logging in, which is the
+   * most CAPTCHA-prone thing this service does.
+   */
+  BROWSER_PROFILE_DIR: z.string().default('.sessions/profiles'),
   CACHE_TTL_SECONDS: z.coerce.number().int().nonnegative().default(604800),
   /**
    * Set false to bypass the cache entirely — every request performs a live
@@ -184,6 +191,7 @@ function buildConfig() {
     gcsBucket: env.GCS_BUCKET.trim(),
     gcsPrefix: env.GCS_PREFIX,
     sessionStateDir: env.SESSION_STATE_DIR,
+    browserProfileDir: env.BROWSER_PROFILE_DIR,
     cacheTtlSeconds: env.CACHE_TTL_SECONDS,
     cacheEnabled: env.CACHE_ENABLED,
 

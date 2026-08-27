@@ -1,4 +1,5 @@
-import type { Browser, BrowserContext, Page } from 'playwright';
+import type { BrowserContext, Page } from 'playwright';
+import { mkdir } from 'node:fs/promises';
 import type { FastifyBaseLogger } from 'fastify';
 import { ApiError } from '../errors.js';
 import type { Identity } from '../identity/pool.js';
@@ -7,48 +8,56 @@ import { NullSessionStore } from './session-store.js';
 import { LoginChallengeError, performLogin } from './login.js';
 
 /**
- * A warmed, authenticated Chromium session per identity.
+ * A long-lived, logged-in Chromium session per identity.
  *
- * Why this exists at all: LinkedIn fingerprints far more than headers. A raw
- * `undici` request has a different TLS/JA3 signature, different header
- * ordering, and no JS execution — all of which are cheap for LinkedIn to
- * detect. In testing, a bare HTTP client authenticated fine and then had its
- * session invalidated server-side within a handful of requests.
+ * Two ideas do the heavy lifting here.
  *
- * So this class issues the *same* Voyager API calls from inside a real browser
- * page via `fetch()`. The request then carries Chrome's actual TLS fingerprint,
- * its real header ordering, the full cookie jar, and a same-origin `Origin` —
- * because it genuinely is Chrome making a same-origin request.
+ * **1. Voyager calls are issued from inside a real browser page.** LinkedIn
+ * fingerprints far more than headers: a raw HTTP client has a different
+ * TLS/JA3 signature, different header ordering, and no JS execution. In
+ * testing, a bare client authenticated fine and then had its session
+ * invalidated server-side within a handful of requests. Issuing the *same*
+ * API calls via `fetch()` from an authenticated page means the request carries
+ * Chrome's real fingerprint, header ordering and cookie jar — because it
+ * genuinely is Chrome making a same-origin request. It remains API
+ * reverse-engineering; only the transport changed.
  *
- * It is still API reverse-engineering: the response is the same Voyager JSON,
- * parsed by the same parsers. Only the transport changed.
+ * **2. The browser stays open, and its profile persists on disk.** Chromium is
+ * launched with `launchPersistentContext`, so cookies, localStorage, IndexedDB
+ * and device state survive restarts — the same signals LinkedIn's device
+ * recognition uses. The context is never torn down between requests and a
+ * keepalive keeps it fresh.
  *
- * Contexts are cached per identity and reused. A fresh context per request
- * would discard the warmed session and re-trigger the login checks that this
- * whole approach exists to avoid.
+ * That second point is a security measure, not an optimisation. Logging in is
+ * by far the most CAPTCHA-prone action available to this service, so the
+ * design goal is to log in **once** and never again. Everything else — profile
+ * persistence, storage-state sync, the keepalive — exists to avoid a second
+ * login.
  */
 
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-interface CachedContext {
+/**
+ * How often an idle session pings LinkedIn.
+ *
+ * `li_at` rotates on use, so a periodic touch keeps the stored session recent.
+ * A session left untouched for days is far likelier to be expired when finally
+ * needed — and expiry means a fresh automated login, which is exactly what we
+ * are trying never to do.
+ */
+const KEEPALIVE_INTERVAL_MS = 8 * 60_000;
+
+/** Landing page for establishing a session when the caller has no target. */
+const DEFAULT_LANDING = 'https://www.linkedin.com/mynetwork/';
+
+interface LiveSession {
   context: BrowserContext;
   page: Page;
-  warmedAt: number;
+  openedAt: number;
+  lastTouchedAt: number;
+  keepAlive: NodeJS.Timeout;
 }
-
-/** Re-warm a context that has been idle this long, rather than trusting it blindly. */
-const WARM_TTL_MS = 10 * 60_000;
-
-/**
- * Where to land when establishing a session. Deliberately NOT /feed/ — the feed
- * is heavy, personalised, and aggressively rate-limited (observed returning 429
- * on a first load), which made session warm-up the most fragile step in the
- * whole pipeline. Callers that know their target pass the profile URL instead,
- * so the single navigation both establishes the session and renders the page
- * whose payloads we want.
- */
-const DEFAULT_LANDING = 'https://www.linkedin.com/mynetwork/';
 
 export interface InPageResponse {
   status: number;
@@ -57,37 +66,246 @@ export interface InPageResponse {
   bodyText: string;
 }
 
-export class BrowserSession {
-  private browser: Browser | null = null;
-  private launching: Promise<Browser> | null = null;
-  private readonly contexts = new Map<string, CachedContext>();
+export interface SessionStats {
+  identity: string;
+  open: boolean;
+  ageSeconds: number;
+  idleSeconds: number;
+}
 
-  /**
-   * In-flight automatic logins, keyed by identity. A burst of requests against
-   * a cold service would otherwise each start their own login, and several
-   * simultaneous logins from one account is a reliable way to get challenged.
-   */
+export class BrowserSession {
+  private readonly sessions = new Map<string, LiveSession>();
+  private readonly opening = new Map<string, Promise<LiveSession>>();
   private readonly logins = new Map<string, Promise<StorageState>>();
+  private closed = false;
 
   constructor(
     private readonly logger: FastifyBaseLogger,
     private readonly store: SessionStore = new NullSessionStore(),
-    /**
-     * Optional credentials for automatic session bootstrap. When present, a
-     * cold start (or an invalidated session) re-establishes itself without a
-     * human — which is what makes a deploy self-sufficient.
-     */
     private readonly credentials: { email: string; password: string } | null = null,
+    /** Root for per-identity Chromium profile directories. */
+    private readonly profileRoot = '.sessions/profiles',
   ) {}
 
+  // ─── Session lifecycle ─────────────────────────────────────────────────────
+
   /**
-   * Establishes a session by logging in, headlessly. Deduplicated per identity.
-   *
-   * This is best-effort by nature: LinkedIn challenges automated logins far
-   * more often than human ones, and a challenge cannot be answered on a server.
-   * When that happens the error says so explicitly, so the operator knows to
-   * run `npm run login` rather than hunting a phantom bug.
+   * Returns the identity's live page, opening the browser if this is the first
+   * call. Deduplicated: a burst of requests against a cold service must not
+   * each launch their own Chromium.
    */
+  private async session(identity: Identity, landingUrl = DEFAULT_LANDING): Promise<LiveSession> {
+    const live = this.sessions.get(identity.id);
+    if (live && !live.page.isClosed()) {
+      live.lastTouchedAt = Date.now();
+      return live;
+    }
+
+    const inFlight = this.opening.get(identity.id);
+    if (inFlight) return inFlight;
+
+    const opening = this.open(identity, landingUrl).finally(() => this.opening.delete(identity.id));
+    this.opening.set(identity.id, opening);
+    return opening;
+  }
+
+  private async open(identity: Identity, landingUrl: string): Promise<LiveSession> {
+    const { chromium } = await import('playwright');
+    const profileDir = `${this.profileRoot}/${identity.id}`;
+    await mkdir(profileDir, { recursive: true });
+
+    const timezone = identity.cookies.timezone;
+
+    // A persistent profile keeps the browser's whole identity — cookies,
+    // localStorage, IndexedDB, device state — across restarts, which is what
+    // lets LinkedIn recognise this as a device it has already seen.
+    const context = await chromium.launchPersistentContext(profileDir, {
+      headless: true,
+      userAgent: UA,
+      viewport: { width: 1440, height: 900 },
+      locale: 'en-US',
+      // A mismatch against the account's own timezone cookie is an
+      // inconsistency a real browser never produces.
+      timezoneId: isValidTimezone(timezone ?? '') ? timezone : 'UTC',
+      args: [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        // Removes the navigator.webdriver tell without a stealth plugin.
+        '--disable-blink-features=AutomationControlled',
+      ],
+      ...(identity.proxyUrl ? { proxy: toPlaywrightProxy(identity.proxyUrl) } : {}),
+    });
+
+    try {
+      await this.seed(identity, context);
+
+      const page = context.pages()[0] ?? (await context.newPage());
+      // Images and fonts are most of the bytes and none of the data.
+      await page.route('**/*', (route) => {
+        const type = route.request().resourceType();
+        return type === 'image' || type === 'font' || type === 'media' ? route.abort() : route.continue();
+      });
+
+      await this.navigate(identity, page, landingUrl);
+      await this.assertAuthenticated(identity, page, context);
+
+      const live: LiveSession = {
+        context,
+        page,
+        openedAt: Date.now(),
+        lastTouchedAt: Date.now(),
+        keepAlive: setInterval(() => {
+          void this.touch(identity);
+        }, KEEPALIVE_INTERVAL_MS),
+      };
+      // Never let the keepalive hold the process open on shutdown.
+      live.keepAlive.unref?.();
+
+      this.sessions.set(identity.id, live);
+      await this.persist(identity, context);
+      this.logger.info({ identity: identity.label, profileDir }, 'browser session open and authenticated');
+      return live;
+    } catch (error) {
+      await context.close().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * Populates a *new* profile. Order matters: an existing profile directory is
+   * already authoritative, so nothing is injected over it.
+   */
+  private async seed(identity: Identity, context: BrowserContext): Promise<void> {
+    const existing = await context.cookies('https://www.linkedin.com').catch(() => []);
+    if (existing.some((c) => c.name === 'li_at')) {
+      this.logger.debug({ identity: identity.label }, 'persistent profile already carries a session');
+      return;
+    }
+
+    const stored = await this.store.load(identity.id).catch(() => null);
+    if (stored?.cookies?.length) {
+      await context.addCookies(stored.cookies as never);
+      this.logger.info({ identity: identity.label }, 'seeded profile from stored session state');
+      return;
+    }
+
+    if (identity.liAt) {
+      await context.addCookies(toPlaywrightCookies(identity));
+      this.logger.info({ identity: identity.label }, 'seeded profile from configured cookie jar');
+      return;
+    }
+
+    const state = await this.autoLogin(identity);
+    await context.addCookies(state.cookies as never);
+  }
+
+  private async navigate(identity: Identity, page: Page, url: string): Promise<void> {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    } catch (error) {
+      // LinkedIn answers an unauthenticated navigation with a 302 back to the
+      // same URL that also clears the auth cookies; with no valid session the
+      // browser follows it forever.
+      if (String((error as Error).message).includes('ERR_TOO_MANY_REDIRECTS')) {
+        throw new ApiError(
+          'AUTH_FAILED',
+          `LinkedIn put identity "${identity.label}" into a cookie-clearing redirect loop — the session is not valid.`,
+          { details: { url, identity: identity.label } },
+        );
+      }
+      throw new ApiError('UPSTREAM_BLOCKED', `Browser navigation failed: ${(error as Error).message}`, { cause: error });
+    }
+  }
+
+  /**
+   * Confirms the session against the API rather than the DOM. LinkedIn serves a
+   * guest-rendered page to an unauthenticated navigation while `fetch()` from
+   * the same origin still authenticates, so DOM inspection genuinely cannot
+   * tell you whether you are logged in — `/voyager/api/me` can.
+   */
+  private async assertAuthenticated(identity: Identity, page: Page, context: BrowserContext): Promise<void> {
+    const status = await page.evaluate(async () => {
+      const csrf = (document.cookie.match(/JSESSIONID="?([^";]+)"?/)?.[1] ?? '').replace(/"/g, '');
+      const response = await fetch('/voyager/api/me', {
+        credentials: 'include',
+        headers: {
+          accept: 'application/vnd.linkedin.normalized+json+2.1',
+          'csrf-token': csrf,
+          'x-restli-protocol-version': '2.0.0',
+        },
+      });
+      return response.status;
+    });
+
+    if (status === 200) return;
+
+    // The profile is stale. Clear it and bootstrap a fresh login, once.
+    this.logger.warn({ identity: identity.label, status }, 'stored session is no longer valid; re-establishing');
+    await this.store.clear(identity.id).catch(() => undefined);
+
+    const state = await this.autoLogin(identity);
+    await context.clearCookies();
+    await context.addCookies(state.cookies as never);
+    await this.navigate(identity, page, DEFAULT_LANDING);
+
+    const recheck = await page.evaluate(async () => {
+      const csrf = (document.cookie.match(/JSESSIONID="?([^";]+)"?/)?.[1] ?? '').replace(/"/g, '');
+      const response = await fetch('/voyager/api/me', {
+        credentials: 'include',
+        headers: { accept: 'application/vnd.linkedin.normalized+json+2.1', 'csrf-token': csrf, 'x-restli-protocol-version': '2.0.0' },
+      });
+      return response.status;
+    });
+
+    if (recheck !== 200) {
+      throw new ApiError('AUTH_FAILED', `Identity "${identity.label}" could not be authenticated (me returned ${recheck}).`);
+    }
+  }
+
+  /**
+   * Keepalive. Touches LinkedIn and persists whatever token it rotated to.
+   * Skipped while the session is actively serving requests — real traffic
+   * already keeps it warm.
+   */
+  private async touch(identity: Identity): Promise<void> {
+    const live = this.sessions.get(identity.id);
+    if (!live || this.closed || live.page.isClosed()) return;
+    if (Date.now() - live.lastTouchedAt < KEEPALIVE_INTERVAL_MS) return;
+
+    try {
+      const status = await live.page.evaluate(async () => {
+        const csrf = (document.cookie.match(/JSESSIONID="?([^";]+)"?/)?.[1] ?? '').replace(/"/g, '');
+        const response = await fetch('/voyager/api/me', {
+          credentials: 'include',
+          headers: { accept: 'application/vnd.linkedin.normalized+json+2.1', 'csrf-token': csrf, 'x-restli-protocol-version': '2.0.0' },
+        });
+        return response.status;
+      });
+
+      live.lastTouchedAt = Date.now();
+      await this.persist(identity, live.context);
+      this.logger.debug({ identity: identity.label, status }, 'session keepalive');
+
+      if (status === 401 || status === 403) {
+        this.logger.warn({ identity: identity.label, status }, 'keepalive found the session invalid; dropping it');
+        await this.invalidate(identity);
+      }
+    } catch (error) {
+      this.logger.debug({ err: error, identity: identity.label }, 'keepalive failed (non-fatal)');
+    }
+  }
+
+  /** Mirrors the live profile into the session store so a rebuilt VM recovers it. */
+  private async persist(identity: Identity, context: BrowserContext): Promise<void> {
+    try {
+      await this.store.save(identity.id, (await context.storageState()) as StorageState);
+    } catch (error) {
+      this.logger.error({ err: error, identity: identity.label }, 'failed to persist browser session state');
+    }
+  }
+
+  // ─── Automatic login ───────────────────────────────────────────────────────
+
   private async autoLogin(identity: Identity): Promise<StorageState> {
     const existing = this.logins.get(identity.id);
     if (existing) {
@@ -118,9 +336,7 @@ export class BrowserSession {
       await this.store.save(identity.id, state as StorageState);
       this.logger.info({ identity: identity.label, account: firstName }, 'automatic login succeeded; session stored');
       return state as StorageState;
-    })().finally(() => {
-      this.logins.delete(identity.id);
-    });
+    })().finally(() => this.logins.delete(identity.id));
 
     this.logins.set(identity.id, attempt);
 
@@ -128,7 +344,10 @@ export class BrowserSession {
       return await attempt;
     } catch (error) {
       if (error instanceof LoginChallengeError) {
-        throw new ApiError('AUTH_FAILED', error.message, { cause: error, details: { identity: identity.label, needsHuman: true } });
+        throw new ApiError('AUTH_FAILED', error.message, {
+          cause: error,
+          details: { identity: identity.label, needsHuman: true },
+        });
       }
       throw new ApiError(
         'AUTH_FAILED',
@@ -138,138 +357,28 @@ export class BrowserSession {
     }
   }
 
-  private async getBrowser(): Promise<Browser> {
-    if (this.browser?.isConnected()) return this.browser;
-
-    this.launching ??= (async () => {
-      const { chromium } = await import('playwright');
-      const browser = await chromium.launch({
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-dev-shm-usage',
-          // Removes the `navigator.webdriver` tell without needing a stealth plugin.
-          '--disable-blink-features=AutomationControlled',
-        ],
-      });
-      this.browser = browser;
-      this.launching = null;
-      return browser;
-    })();
-
-    return this.launching;
-  }
-
-  /**
-   * Returns a page that has already loaded an authenticated LinkedIn document.
-   * Navigating first matters: it lets LinkedIn set its own routing cookies
-   * (`lidc`) and completes whatever client-side handshake the SPA performs, so
-   * subsequent in-page fetches look like ordinary SPA traffic.
-   */
-  private async warmPage(identity: Identity, landingUrl = DEFAULT_LANDING): Promise<Page> {
-    const cached = this.contexts.get(identity.id);
-    if (cached && Date.now() - cached.warmedAt < WARM_TTL_MS && !cached.page.isClosed()) {
-      return cached.page;
-    }
-
-    await this.dispose(identity.id);
-
-    const browser = await this.getBrowser();
-    const timezone = identity.cookies.timezone || 'UTC';
-
-    // Prefer persisted state: it holds whatever li_at LinkedIn most recently
-    // rotated to. The configured cookie jar is only a bootstrap seed, and
-    // credentials are the last resort that makes a cold deploy self-healing.
-    let persisted = await this.store.load(identity.id).catch(() => null);
-    if (!persisted && !identity.liAt && this.credentials) {
-      persisted = await this.autoLogin(identity);
-    }
-
-    const context = await browser.newContext({
-      userAgent: UA,
-      viewport: { width: 1440, height: 900 },
-      locale: 'en-US',
-      // Match the account's own timezone cookie — a mismatch here is exactly
-      // the kind of inconsistency LinkedIn correlates against.
-      timezoneId: isValidTimezone(timezone) ? timezone : 'UTC',
-      ...(identity.proxyUrl ? { proxy: toPlaywrightProxy(identity.proxyUrl) } : {}),
-      ...(persisted ? { storageState: persisted as never } : {}),
-    });
-
-    if (!persisted) {
-      if (!identity.liAt) {
-        await context.close().catch(() => undefined);
-        throw new ApiError(
-          'AUTH_FAILED',
-          `Identity "${identity.label}" has no stored session, no cookie seed and no credentials. ` +
-            'Run `npm run login` to establish one.',
-          { details: { identity: identity.label } },
-        );
-      }
-      this.logger.info({ identity: identity.label }, 'no persisted session; seeding from configured cookie jar');
-      await context.addCookies(toPlaywrightCookies(identity));
-    }
-
-    const page = await context.newPage();
-    // Images and fonts are most of the bytes and none of the data.
-    await page.route('**/*', (route) => {
-      const type = route.request().resourceType();
-      return type === 'image' || type === 'font' || type === 'media' ? route.abort() : route.continue();
-    });
-
-    let response;
-    try {
-      response = await page.goto(landingUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-    } catch (error) {
-      await context.close().catch(() => undefined);
-      // LinkedIn answers an unauthenticated navigation with a 302 back to the
-      // same URL that also clears the auth cookies. With no valid session the
-      // browser follows it forever.
-      if (String((error as Error).message).includes('ERR_TOO_MANY_REDIRECTS')) {
-        throw new ApiError(
-          'AUTH_FAILED',
-          `LinkedIn put identity "${identity.label}" into a cookie-clearing redirect loop. The session is not valid — it has expired, been invalidated, or the cookies are scoped to the wrong domain.`,
-          { details: { landingUrl, identity: identity.label } },
-        );
-      }
-      throw new ApiError('UPSTREAM_BLOCKED', `Browser navigation failed: ${(error as Error).message}`, { cause: error });
-    }
-
-    const landed = page.url();
-    if (landed.includes('/authwall') || landed.includes('/login') || landed.includes('/checkpoint')) {
-      await context.close().catch(() => undefined);
-      throw new ApiError(
-        'AUTH_FAILED',
-        `LinkedIn bounced identity "${identity.label}" to ${landed.includes('/checkpoint') ? 'a security checkpoint' : 'the auth wall'}. The session needs a fresh login.`,
-        { details: { landedOn: landed, identity: identity.label } },
-      );
-    }
-
-    const status = response?.status() ?? 0;
-    if (status === 999 || status === 429) {
-      await context.close().catch(() => undefined);
-      throw new ApiError('UPSTREAM_BLOCKED', `LinkedIn returned ${status} while warming the browser session.`);
-    }
-
-    this.contexts.set(identity.id, { context, page, warmedAt: Date.now() });
-    await this.persist(identity, context);
-    this.logger.debug({ identity: identity.label }, 'browser session warmed');
-    return page;
-  }
+  // ─── Voyager over the live page ────────────────────────────────────────────
 
   /**
    * Issues a Voyager API call from inside the authenticated page.
    *
-   * `credentials: 'include'` makes the browser attach the real cookie jar, so
-   * we never hand cookies to the page ourselves. The csrf-token header is still
-   * required — it is what Voyager checks — and is read from the live jar rather
-   * than from config, so a token LinkedIn rotated mid-session stays correct.
+   * `credentials: 'include'` lets the browser attach its own cookie jar, so we
+   * never hand it cookies. The csrf-token header is still required — Voyager
+   * checks it — and is read from the live jar rather than from config, so a
+   * token LinkedIn rotated mid-session stays correct.
    */
   async fetchVoyager(identity: Identity, path: string, landingUrl?: string): Promise<InPageResponse> {
-    const page = await this.warmPage(identity, landingUrl);
+    const live = await this.session(identity, landingUrl);
+
+    // Same-origin navigation keeps the page on the profile being scraped, so
+    // in-page requests look like that page's own traffic.
+    if (landingUrl && !live.page.url().startsWith(landingUrl)) {
+      await this.navigate(identity, live.page, landingUrl);
+    }
+
     const url = path.startsWith('http') ? path : `https://www.linkedin.com/voyager/api${path}`;
 
-    const result = await page.evaluate(async (target: string): Promise<InPageResponse> => {
+    const result = await live.page.evaluate(async (target: string): Promise<InPageResponse> => {
       const csrf = (document.cookie.match(/JSESSIONID="?([^";]+)"?/)?.[1] ?? '').replace(/"/g, '');
 
       const response = await fetch(target, {
@@ -293,27 +402,13 @@ export class BrowserSession {
       return { status: response.status, url: response.url, body, bodyText };
     }, url);
 
+    live.lastTouchedAt = Date.now();
     // Persist before asserting: even a failed call may have rotated the token,
     // and losing the new value is what turns one failure into a dead session.
-    const cached = this.contexts.get(identity.id);
-    if (cached) await this.persist(identity, cached.context);
+    await this.persist(identity, live.context);
 
     this.assertUsable(result, identity, path);
     return result;
-  }
-
-  /**
-   * Captures the context's current cookies so a rotated li_at survives the
-   * process. Best-effort: a failure to persist must never fail a request, but
-   * it does mean the next run replays a stale token, so it is logged loudly.
-   */
-  private async persist(identity: Identity, context: BrowserContext): Promise<void> {
-    try {
-      const state = await context.storageState();
-      await this.store.save(identity.id, state as never);
-    } catch (error) {
-      this.logger.error({ err: error, identity: identity.label }, 'failed to persist browser session state');
-    }
   }
 
   private assertUsable(result: InPageResponse, identity: Identity, path: string): void {
@@ -331,8 +426,8 @@ export class BrowserSession {
     if (status === 401) {
       throw new ApiError('AUTH_FAILED', `LinkedIn rejected the session for identity "${identity.label}".`);
     }
-    // The in-page fetch follows redirects, so an auth bounce shows up as a
-    // 200 whose final URL is the login page rather than as a 3xx.
+    // The in-page fetch follows redirects, so an auth bounce arrives as a 200
+    // whose final URL is the login page rather than as a 3xx.
     if (result.url.includes('/authwall') || result.url.includes('/uas/login') || result.url.includes('/checkpoint')) {
       throw new ApiError('AUTH_FAILED', 'The in-page request was redirected to login — the session is no longer valid.', {
         details: { landedOn: result.url },
@@ -352,39 +447,24 @@ export class BrowserSession {
 
   /**
    * Loads the rendered profile page and harvests every Voyager payload it
-   * carries — both the server-rendered `<code id="bpr-guid-…">` blobs the SPA
-   * hydrates from, and the XHRs the page fires for itself.
+   * carries — both server-rendered blobs and the XHRs the page fires itself.
    */
   async collectRenderedPayloads(identity: Identity, publicId: string): Promise<unknown[]> {
     const profileUrl = `https://www.linkedin.com/in/${encodeURIComponent(publicId)}/`;
-    const page = await this.warmPage(identity, profileUrl);
+    const live = await this.session(identity, profileUrl);
     const payloads: unknown[] = [];
 
     const onResponse = (response: { url(): string; json(): Promise<unknown> }) => {
       if (!response.url().includes('/voyager/api/')) return;
       response.json().then((body) => payloads.push(body)).catch(() => undefined);
     };
-    page.on('response', onResponse);
+    live.page.on('response', onResponse);
 
     try {
-      const response = await page.goto(`https://www.linkedin.com/in/${encodeURIComponent(publicId)}/`, {
-        waitUntil: 'domcontentloaded',
-        timeout: 45_000,
-      });
+      await this.navigate(identity, live.page, profileUrl);
+      await live.page.waitForTimeout(3_000);
 
-      const status = response?.status() ?? 0;
-      if (status === 404) throw new ApiError('PROFILE_NOT_FOUND', 'LinkedIn has no profile at that identifier.');
-      if (status === 999 || status === 429) {
-        throw new ApiError('UPSTREAM_BLOCKED', `LinkedIn returned ${status} to the headless browser.`);
-      }
-      if (page.url().includes('/authwall') || page.url().includes('/login')) {
-        throw new ApiError('AUTH_FAILED', 'LinkedIn redirected to the auth wall — the session is not valid.');
-      }
-
-      // Let the SPA fire its own section requests.
-      await page.waitForTimeout(3_000);
-
-      const inline = await page.evaluate(() =>
+      const inline = await live.page.evaluate(() =>
         Array.from(document.querySelectorAll('code[id^="bpr-guid-"]'))
           .map((node) => node.textContent ?? '')
           .filter((text) => text.includes('"data"') || text.includes('"included"')),
@@ -398,42 +478,51 @@ export class BrowserSession {
         }
       }
 
+      live.lastTouchedAt = Date.now();
       return payloads;
     } finally {
-      page.off('response', onResponse);
+      live.page.off('response', onResponse);
     }
   }
 
-  /**
-   * Discards persisted state after an authentication failure. Keeping it would
-   * make every subsequent attempt replay the same dead token; clearing it lets
-   * the configured seed jar be tried again.
-   */
+  // ─── Teardown ──────────────────────────────────────────────────────────────
+
+  /** Discards a session whose credentials LinkedIn has rejected. */
   async invalidate(identity: Identity): Promise<void> {
     await this.dispose(identity.id);
     await this.store.clear(identity.id).catch(() => undefined);
     this.logger.warn(
       { identity: identity.label, willRelogin: this.credentials !== null },
-      'cleared persisted session state after auth failure',
+      'cleared session state after auth failure',
     );
   }
 
-  /** Drops a poisoned context so the next call re-warms from scratch. */
   async dispose(identityId: string): Promise<void> {
-    const cached = this.contexts.get(identityId);
-    if (!cached) return;
-    this.contexts.delete(identityId);
-    await cached.context.close().catch(() => undefined);
+    const live = this.sessions.get(identityId);
+    if (!live) return;
+    this.sessions.delete(identityId);
+    clearInterval(live.keepAlive);
+    await live.context.close().catch(() => undefined);
+  }
+
+  stats(): SessionStats[] {
+    const now = Date.now();
+    return [...this.sessions.entries()].map(([identity, live]) => ({
+      identity,
+      open: !live.page.isClosed(),
+      ageSeconds: Math.floor((now - live.openedAt) / 1000),
+      idleSeconds: Math.floor((now - live.lastTouchedAt) / 1000),
+    }));
   }
 
   async close(): Promise<void> {
-    for (const id of [...this.contexts.keys()]) await this.dispose(id);
-    await this.browser?.close().catch(() => undefined);
-    this.browser = null;
+    this.closed = true;
+    for (const id of [...this.sessions.keys()]) await this.dispose(id);
   }
 }
 
 function isValidTimezone(tz: string): boolean {
+  if (!tz) return false;
   try {
     new Intl.DateTimeFormat('en-US', { timeZone: tz });
     return true;
@@ -444,18 +533,17 @@ function isValidTimezone(tz: string): boolean {
 
 /**
  * LinkedIn scopes its auth cookies to `.www.linkedin.com` and its
- * browser-identity cookies to `.linkedin.com`. Confirmed straight off the wire —
- * the Set-Cookie headers LinkedIn sends when it invalidates a session read:
+ * browser-identity cookies to `.linkedin.com`. Confirmed off the wire, from the
+ * Set-Cookie headers LinkedIn sends when invalidating a session:
  *
- *   li_at=delete me; Domain=.www.linkedin.com
- *   li_a="delete me"; Domain=.www.linkedin.com
- *   liap=delete me;  Domain=.linkedin.com
+ *   li_at=delete me;   Domain=.www.linkedin.com
+ *   li_a="delete me";  Domain=.www.linkedin.com
+ *   liap=delete me;    Domain=.linkedin.com
  *
- * Putting them all on `.linkedin.com` (the obvious guess) means the browser
- * never sends li_at to www.linkedin.com, LinkedIn treats the navigation as
- * unauthenticated, and its "clear your cookies and retry" 302 becomes an
- * infinite redirect loop surfacing as ERR_TOO_MANY_REDIRECTS — which looks
- * nothing like the cookie-scope bug it actually is.
+ * Putting them all on `.linkedin.com` — the obvious guess — means the browser
+ * never sends li_at to www.linkedin.com, and LinkedIn's clear-and-retry 302
+ * becomes an infinite redirect loop surfacing as ERR_TOO_MANY_REDIRECTS, which
+ * looks nothing like the cookie-scope bug it is.
  */
 const WWW_SCOPED = new Set(['li_at', 'li_a', 'JSESSIONID', 'li_rm']);
 
@@ -464,15 +552,20 @@ export function toPlaywrightCookies(identity: Identity) {
   jar.li_at = identity.liAt;
   jar.JSESSIONID = `"${identity.csrfToken}"`;
 
-  return Object.entries(jar).map(([name, value]) => ({
-    name,
-    value,
-    domain: WWW_SCOPED.has(name) ? '.www.linkedin.com' : '.linkedin.com',
-    path: '/',
-    secure: true,
-    httpOnly: name === 'li_at' || name === 'li_rm',
-    sameSite: 'None' as const,
-  }));
+  return Object.entries(jar)
+    .filter(([, value]) => value)
+    .map(([name, value]) => ({
+      name,
+      value,
+      domain: WWW_SCOPED.has(name) ? '.www.linkedin.com' : '.linkedin.com',
+      path: '/',
+      secure: true,
+      httpOnly: name === 'li_at' || name === 'li_rm',
+      // NOT 'None': Chromium blocks SameSite=None cookies as third-party by
+      // default, which stores them but silently never sends them. Our requests
+      // are same-site, so Lax is both correct and unblocked.
+      sameSite: 'Lax' as const,
+    }));
 }
 
 /** Playwright wants proxy credentials split out of the URL. */

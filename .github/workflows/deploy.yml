@@ -177,11 +177,11 @@ jobs:
           for i in $(seq 1 20); do
             if gcloud compute ssh "${{ secrets.GCP_VM }}" --zone "${{ secrets.GCP_ZONE }}" \
                  --project "${{ secrets.GCP_PROJECT }}" --quiet \
-                 --command 'curl -sf --max-time 10 http://127.0.0.1:8080/healthz >/dev/null' 2>/dev/null; then
+                 --command 'cd /opt/linkedin-api && sudo docker compose exec -T api node -e "fetch(String.raw\`http://127.0.0.1:8080/healthz\`).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"' 2>/dev/null; then
               echo "container healthy on the VM"
               gcloud compute ssh "${{ secrets.GCP_VM }}" --zone "${{ secrets.GCP_ZONE }}" \
                 --project "${{ secrets.GCP_PROJECT }}" --quiet \
-                --command 'curl -s --max-time 10 http://127.0.0.1:8080/health'
+                --command 'cd /opt/linkedin-api && sudo docker compose exec -T api node -e "fetch(String.raw\`http://127.0.0.1:8080/health\`).then(r=>r.text()).then(t=>console.log(t))"'
               exit 0
             fi
             echo "container health $i/20…"; sleep 10

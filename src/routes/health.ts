@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import type { ProfileCache } from '../cache/index.js';
 import type { IdentityPool } from '../identity/pool.js';
 import type { ScrapeLimiter } from '../ratelimit/scrape-limiter.js';
+import type { BrowserSession } from '../browser/session.js';
 
 /**
  * Health is deliberately unauthenticated but leaks nothing sensitive: identity
@@ -9,18 +10,32 @@ import type { ScrapeLimiter } from '../ratelimit/scrape-limiter.js';
  */
 export function registerHealthRoutes(
   app: FastifyInstance,
-  deps: { pool: IdentityPool; cache: ProfileCache; limiter: ScrapeLimiter; startedAt: number },
+  deps: {
+    pool: IdentityPool;
+    cache: ProfileCache;
+    limiter: ScrapeLimiter;
+    startedAt: number;
+    browserSession: BrowserSession | null;
+  },
 ): void {
   app.get('/health', async () => {
     const identities = deps.pool.health();
     const cacheHealthy = await deps.cache.healthy();
     const anyIdentityUsable = identities.some((i) => i.state === 'available');
 
+    const budget = deps.limiter.status();
+
     return {
       status: anyIdentityUsable && cacheHealthy ? 'ok' : 'degraded',
       uptimeSeconds: Math.floor((Date.now() - deps.startedAt) / 1000),
+      // Promoted to the top level: "how many scrapes do I have left right now"
+      // is the question this endpoint is most often asked.
+      requestsRemaining: budget.remaining,
+      scrapeBudget: budget,
       cache: { kind: deps.cache.kind, healthy: cacheHealthy },
-      scrapeBudget: deps.limiter.status(),
+      // A session that is open and recently touched is one that will not need
+      // to log in again — which is the whole point of keeping it warm.
+      browserSessions: deps.browserSession?.stats() ?? [],
       identities,
     };
   });

@@ -17,6 +17,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       SESSION_IDENTITIES: ${SESSION_IDENTITIES:-primary}
+      SESSION_STATE_DIR: /app/.sessions
+      BROWSER_PROFILE_DIR: /app/.sessions/profiles
       GCS_BUCKET: ${GCS_BUCKET}
       CACHE_ENABLED: ${CACHE_ENABLED:-true}
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-604800}
@@ -32,8 +34,10 @@ services:
       PROXY_URLS: ${PROXY_URLS:-}
       PROXY_STICKY_TEMPLATE: ${PROXY_STICKY_TEMPLATE:-}
     volumes:
-      # Local fallback for session state. GCS is authoritative when GCS_BUCKET
-      # is set; this keeps a warm copy across container restarts.
+      # Holds both the session state and the persistent Chromium profiles.
+      # This volume is what keeps the browser recognised as the same device
+      # across redeploys, so the service does not have to log in again — and
+      # logging in is the most CAPTCHA-prone thing it can do.
       - session-state:/app/.sessions
     # Chromium needs more than the default 64MB of shared memory.
     shm_size: 1gb
@@ -51,6 +55,11 @@ services:
     restart: unless-stopped
     depends_on:
       - api
+    environment:
+      # Substituted into the Caddyfile as {$PUBLIC_HOST}. Without it the
+      # site block collapses to a bare `{`, which Caddy parses as the global
+      # options block and then rejects every directive inside it.
+      PUBLIC_HOST: ${PUBLIC_HOST}
     ports:
       - "80:80"
       - "443:443"

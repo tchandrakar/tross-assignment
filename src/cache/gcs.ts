@@ -72,10 +72,19 @@ export class GcsProfileCache implements ProfileCache {
     }
   }
 
+  /**
+   * Probes an object rather than the bucket. `bucket.exists()` requires
+   * `storage.buckets.get`, which `roles/storage.objectAdmin` does not grant —
+   * so a correctly least-privileged service account reported the cache as
+   * unhealthy while reads and writes worked perfectly.
+   *
+   * A 404 on a nonexistent object is a healthy answer: it proves we can reach
+   * the bucket and are authorised to read it.
+   */
   async healthy(): Promise<boolean> {
     try {
-      const [exists] = await this.bucket.exists();
-      return exists;
+      await this.bucket.file(`${this.prefix}.healthcheck`).exists();
+      return true;
     } catch {
       return false;
     }
