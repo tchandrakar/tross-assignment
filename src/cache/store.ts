@@ -1,7 +1,16 @@
 import type { Profile, ScrapeSource } from '../schema/profile.js';
 
-/** What we persist per profile. Versioned so a schema change invalidates old blobs. */
-export const CACHE_SCHEMA_VERSION = 1;
+/**
+ * What we persist per profile. Versioned so a schema change invalidates old
+ * blobs rather than serving stale-shaped JSON.
+ *
+ * v2 — the transport was replaced with direct HTTP, so `meta.source` values
+ *      from the browser era ("browser-voyager", "browser", "voyager-graphql")
+ *      are no longer members of the documented enum. Entries written before
+ *      that change would otherwise keep being served with a source a client
+ *      cannot map.
+ */
+export const CACHE_SCHEMA_VERSION = 2;
 
 export interface CachedProfile {
   schemaVersion: number;
