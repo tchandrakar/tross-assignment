@@ -61,13 +61,6 @@ const envSchema = z.object({
   GCS_BUCKET: z.string().default(''),
   GCS_PREFIX: z.string().default('profiles/'),
   SESSION_STATE_DIR: z.string().default('.sessions'),
-  /**
-   * Root for persistent Chromium profile directories, one per identity. Keeping
-   * a real browser profile on disk is what lets LinkedIn recognise the device
-   * across restarts — and therefore what avoids re-logging in, which is the
-   * most CAPTCHA-prone thing this service does.
-   */
-  BROWSER_PROFILE_DIR: z.string().default('.sessions/profiles'),
   CACHE_TTL_SECONDS: z.coerce.number().int().nonnegative().default(604800),
   /**
    * Set false to bypass the cache entirely — every request performs a live
@@ -82,22 +75,6 @@ const envSchema = z.object({
   CLIENT_RATE_PER_MINUTE: z.coerce.number().int().positive().max(600).default(10),
   /** Tier 3 — total requests per minute across the whole service. */
   GLOBAL_RATE_PER_MINUTE: z.coerce.number().int().positive().max(6000).default(20),
-  ENABLE_BROWSER_FALLBACK: z
-    .enum(['true', 'false'])
-    .default('true')
-    .transform((v) => v === 'true'),
-  /**
-   * Raw-HTTP Voyager calls. Off by default: an HTTP client is trivially
-   * distinguishable from Chrome (TLS/JA3 signature, header ordering, no JS),
-   * and in testing LinkedIn responded by invalidating the session server-side
-   * within a handful of requests. The browser transport makes the identical
-   * API calls without that cost. Enable only to demonstrate the raw path, or
-   * where session lifetime does not matter.
-   */
-  ENABLE_HTTP_TRANSPORT: z
-    .enum(['true', 'false'])
-    .default('false')
-    .transform((v) => v === 'true'),
 });
 
 /** Accepts a raw `document.cookie` string: "a=1; b=2; c=3". */
@@ -196,15 +173,12 @@ function buildConfig() {
     gcsBucket: env.GCS_BUCKET.trim(),
     gcsPrefix: env.GCS_PREFIX,
     sessionStateDir: env.SESSION_STATE_DIR,
-    browserProfileDir: env.BROWSER_PROFILE_DIR,
     cacheTtlSeconds: env.CACHE_TTL_SECONDS,
     cacheEnabled: env.CACHE_ENABLED,
 
     scrapeRatePerMinute: env.SCRAPE_RATE_PER_MINUTE,
     clientRatePerMinute: env.CLIENT_RATE_PER_MINUTE,
     globalRatePerMinute: env.GLOBAL_RATE_PER_MINUTE,
-    enableBrowserFallback: env.ENABLE_BROWSER_FALLBACK,
-    enableHttpTransport: env.ENABLE_HTTP_TRANSPORT,
   } as const;
 }
 

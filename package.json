@@ -1,7 +1,7 @@
 {
   "name": "linkedin-profile-api",
   "version": "1.0.0",
-  "description": "Reverse-engineered LinkedIn profile API \u2014 accepts a LinkedIn profile URL, returns structured JSON.",
+  "description": "Reverse-engineered LinkedIn profile API — accepts a profile URL and returns structured JSON, using direct HTTP calls to LinkedIn's internal endpoints.",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -14,7 +14,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "start:local": "node --env-file-if-exists=.env dist/index.js",
-    "login": "tsx --env-file-if-exists=.env src/browser/login-cli.ts",
+    "login": "tsx --env-file-if-exists=.env src/session/login-cli.ts",
     "postman": "newman run postman/LinkedIn-Profile-API.postman_collection.json -e postman/LinkedIn-Profile-API.postman_environment.json --delay-request 7000"
   },
   "dependencies": {
@@ -25,7 +25,6 @@
     "@google-cloud/storage": "^7.14.0",
     "fastify": "^5.2.0",
     "fastify-type-provider-zod": "^4.0.2",
-    "playwright": "^1.49.1",
     "undici": "^7.2.0",
     "zod": "^3.24.1",
     "zod-to-json-schema": "^3.24.1"

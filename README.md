@@ -86,13 +86,12 @@ stay reachable precisely when a caller is being throttled.
 
 Submits a verification code for a pending upstream challenge.
 
-LinkedIn challenges an unattended sign-in from an unfamiliar device or network,
-and a challenge is bound to the browser session that triggered it — closing that
-session and signing in again simply produces another challenge. The service
-therefore holds the browser open and reports the pending challenge on
-`/health`; this endpoint delivers the code to it, so authentication completes
-without anyone needing access to the browser. On success the resulting session
-is stored and the service is authenticated again with no further action.
+LinkedIn challenges an unattended sign-in from an unfamiliar network, and the
+challenge's hidden form fields are bound to the cookie jar that received them —
+discarding that jar and signing in again simply produces another challenge. The
+service therefore keeps the jar and reports the pending challenge on `/health`;
+this endpoint delivers the code to it. On success the resulting session is
+stored and the service is authenticated again with no further action.
 
 A mistyped code leaves the challenge open so it can be retried. Unanswered
 challenges are reaped after 20 minutes.
@@ -115,7 +114,7 @@ platform to recycle an otherwise healthy container.
 | Header | Values | Meaning |
 |---|---|---|
 | `x-cache` | `HIT` \| `MISS` | Whether the response came from the cache |
-| `x-source` | see `meta.source` | Which extraction path produced the data |
+| `x-source` | `voyager-dash` \| `voyager-profile-view` \| `cache` | Which extraction path produced the data |
 | `retry-after` | seconds | Present on every `429` and on `503` where a wait is known |
 
 ### Success response
@@ -215,7 +214,7 @@ platform to recycle an otherwise healthy container.
 
   "meta": {
     "cached": false,
-    "source": "browser-voyager",
+    "source": "voyager-dash",
     "scrapedAt": "2026-08-27T04:12:44.201Z",
     "ageSeconds": 0,
     "durationMs": 6989,
@@ -400,34 +399,71 @@ references with resolved objects while preserving the raw URN alongside as
 resolution carries a seen-set and marks cycles instead of recursing forever.
 Every parser downstream then works against ordinary nested objects.
 
-### Requests are issued from inside a browser
+### Looking like a browser without being one
 
-LinkedIn fingerprints considerably more than headers. A raw HTTP client has a
-different TLS/JA3 signature, different header ordering, and no JavaScript
-execution. In testing, a plain HTTP client authenticated successfully and then
-had its session invalidated server-side within a handful of requests.
+LinkedIn fingerprints considerably more than the User-Agent string, and a
+default Node client gets three separate layers wrong.
 
-So the service issues the *same* Voyager calls via `fetch()` from inside an
-authenticated Chromium page. The request then carries Chrome's real TLS
-fingerprint, header ordering and cookie jar — because it genuinely is Chrome
-making a same-origin request. This remains API integration, not DOM scraping:
-the response is the same Voyager JSON, parsed by the same code.
+**TLS (JA3).** The cipher suite list, its order, and the offered elliptic curves
+form a fingerprint. Node's defaults differ from Chrome's, so the handshake alone
+identifies the client before a single byte of HTTP is sent. The client declares
+Chrome's cipher order and curve preference explicitly.
 
-The raw HTTP transport is retained behind `ENABLE_HTTP_TRANSPORT=true`, off by
-default. It is the more direct expression of "call the API", and it is useful
-for demonstrating the protocol — but it is not the default, because it degrades
-the credential it depends on.
+**Protocol.** Chrome negotiates HTTP/2. An HTTP/1.1-only client talking to a
+host that offers h2 is itself a signal, so the client enables h2 and advertises
+the same ALPN list.
+
+**Header order.** Browsers emit headers in a stable, characteristic order, and
+the `sec-fetch-*` family must be consistent with what the request actually is —
+a document navigation and an XHR carry different values. `undici` preserves
+insertion order, so the order declared in
+[`http/client.ts`](src/linkedin/http/client.ts) is the order on the wire.
+
+None of this defeats a determined detector. What it does is remove the cheap,
+obvious tells, and combined with honouring cookie rotation it is what makes a
+browser-free client viable.
+
+> One consequence worth recording: advertising `accept-encoding: gzip, deflate,
+> br` means responses arrive compressed, and `undici` does not decompress them.
+> Dropping the header would avoid that but would also make the client look less
+> like a browser, so the client decodes the body itself. Getting this wrong is
+> quiet rather than loud — the body arrives as bytes, every parser silently
+> matches nothing, and it reads like LinkedIn changed its markup.
+
+### Signing in without a browser
+
+LinkedIn's `/login` and `/uas/login` are a React application with no HTML form
+to post: the inputs carry React-generated ids and no `name` attributes, so there
+is nothing a plain HTTP client can submit.
+
+`/checkpoint/lg/login` still serves the classic server-rendered form:
+
+```html
+<form method="post" action="/checkpoint/lg/login-submit">
+  <input type="hidden" name="csrfToken"      value="ajax:…">
+  <input type="hidden" name="loginCsrfParam" value="566bf1a5-…">
+  <input name="session_key"      type="email">
+  <input name="session_password" type="password">
+```
+
+Both hidden fields are bound to the cookies issued alongside the form, so the
+GET and the POST must share a cookie jar — fetching the form and posting from a
+fresh jar fails. A successful sign-in answers `303` with `location: /feed/` and
+sets the session cookie.
+
+A redirect into `/checkpoint/` instead means the credentials were accepted and
+LinkedIn wants verification. That is recoverable: the jar holding the challenge
+is kept, and the emailed code is submitted through
+`POST /v1/admin/session/challenge`.
 
 ### Extraction strategies
 
 Strategies run in order; the first to return a profile with a name wins.
 
-| # | Strategy | Transport | Notes |
-|---|---|---|---|
-| 1 | `browser-voyager` | Voyager from inside an authenticated page | **Default.** Verified against live profiles |
-| 2 | `voyager-graphql` | The same calls over raw HTTP | Off by default; see above |
-| 3 | `voyager-profile-view` | Legacy REST | Returned every section in one call, and took no `queryId`. **Withdrawn — returns `410 Gone`** |
-| 4 | `browser` | Payloads harvested from the rendered page | Last resort |
+| # | Strategy | Notes |
+|---|---|---|
+| 1 | `voyager-dash` | The profile graph. **One request returns the whole profile**, addressed by `decorationId` rather than a rotating GraphQL `queryId` |
+| 2 | `voyager-profile-view` | Legacy REST. Returned every section in one call and took no identifier of any kind. **Withdrawn upstream — `410 Gone`**, retained because it costs one request to try and `410` is unambiguous |
 
 Failure handling distinguishes **three** cases, and the distinction is
 load-bearing:
@@ -471,15 +507,16 @@ live fetch, and a failed write still returns the response.
 
 ## Design decisions
 
-### Session handling: rotation, not replay
+### Following session-token rotation
 
-The obvious approach — copy a session cookie once and reuse it — does not work,
-and fails in a way that resembles something else entirely.
+This is the single most consequential thing to understand about LinkedIn's
+session handling, and getting it wrong looks like something else entirely.
 
-**LinkedIn rotates its session token on use and invalidates the previous
-value.** A copied cookie is a point-in-time snapshot that goes stale within
-minutes, and replaying a superseded token is the signature of a stolen cookie.
-LinkedIn responds by invalidating the session server-side:
+**The session token is rotated on use.** LinkedIn issues a replacement via
+`Set-Cookie` as you browse and invalidates the previous value. A client that
+ignores `Set-Cookie` therefore replays a superseded token on every request —
+which is exactly the signature of a credential lifted from a browser and
+replayed elsewhere. LinkedIn responds by invalidating the session outright:
 
 ```http
 HTTP/2 302
@@ -487,55 +524,22 @@ location: https://www.linkedin.com/voyager/api/me
 set-cookie: li_at=delete me; Expires=Thu, 01-Jan-1970 00:00:00 GMT; Max-Age=0
 ```
 
-That is neither a rate limit nor an expiry — the credential is unrecoverable,
-and re-copying from the same browser session cannot produce a live one.
-Observed directly during development: a freshly-captured session authenticated
-successfully and returned `401` about a minute later from a new browser context,
-because the first request had already rotated the token and the new value was
-discarded along with the context.
+That is neither a rate limit nor an expiry: the credential is unrecoverable, and
+re-copying from the same browser session cannot produce a live one.
 
-The remedy is persistence, not better headers:
+An earlier revision of this service sent a fixed cookie header and never read
+responses back. Its sessions died within a handful of requests, and the symptom
+was misread as TLS fingerprinting. It was not — it was replay.
 
-- Chromium runs against a **persistent profile directory**, so cookies,
-  localStorage, IndexedDB and device state survive restarts. These are the
-  signals LinkedIn's device recognition uses; a fresh context on every run
-  presents as a new device on every run.
-- The browser **stays open** between requests, and a keepalive touches the
-  upstream every eight minutes when idle, persisting whatever token was rotated
-  to.
-- Storage state is mirrored to object storage, so a rebuilt host recovers the
-  session rather than re-authenticating.
+[`http/cookie-jar.ts`](src/linkedin/http/cookie-jar.ts) absorbs every
+`Set-Cookie`, reports which values changed, and the session manager persists the
+jar whenever the token rotates. It also distinguishes an ordinary rotation from
+LinkedIn actively clearing the session, because those need different responses:
+one is routine, the other means the session is gone.
 
-The objective throughout is to authenticate **once**. Re-authentication is the
-most challenge-prone operation the service performs, so every mechanism above
-exists to avoid a second one. A circuit breaker enforces this: after three
-consecutive failed automatic logins — or immediately on a rejected credential —
-automatic login is suspended and the health endpoint reports that operator
-action is required. Retrying a credential that is simply wrong cannot succeed
-and moves the account towards a lockout.
-
-### Cookie scoping
-
-LinkedIn scopes its authentication cookies to `.www.linkedin.com` and its
-browser-identity cookies to `.linkedin.com`. This is observable directly in the
-`Set-Cookie` headers it sends when invalidating a session:
-
-```
-li_at=delete me;   Domain=.www.linkedin.com
-li_a="delete me";  Domain=.www.linkedin.com
-liap=delete me;    Domain=.linkedin.com
-```
-
-Placing them all on `.linkedin.com` — the intuitive choice — means the browser
-never sends the session cookie to `www.linkedin.com`. LinkedIn treats the
-navigation as unauthenticated and responds with its clear-and-retry redirect,
-which the browser follows indefinitely, surfacing as `ERR_TOO_MANY_REDIRECTS`.
-Nothing in that error suggests a cookie-scope problem.
-
-Cookies are also injected with `SameSite=Lax` rather than `None`. Chromium
-blocks `SameSite=None` cookies as third-party by default: they are stored but
-silently never sent. The service's requests are same-site, so `Lax` is both
-correct and unblocked.
+The CSRF token Voyager requires is read from the live jar rather than from
+configuration, for the same reason — a token LinkedIn rotated mid-session stays
+correct.
 
 ### Identity rotation: rotate identities, not addresses
 
@@ -618,7 +622,6 @@ stale-shaped JSON.
 git clone https://github.com/tchandrakar/tross-assignment.git
 cd tross-assignment
 npm install
-npx playwright install chromium
 cp .env.example .env
 ```
 
@@ -628,9 +631,14 @@ Add credentials to `.env`, then establish a session:
 npm run login
 ```
 
-A browser window opens, signs in, pauses if a verification challenge appears so
-it can be completed interactively, verifies the result against the upstream API,
-and writes the session to `.sessions/`.
+This signs in over HTTP — no browser — prompts for a verification code if
+LinkedIn asks for one, confirms the result against the upstream API, and writes
+the session to `.sessions/`.
+
+The service does this for itself on first use. Running it by hand is useful for
+two things the service cannot do alone: establishing the session from a network
+LinkedIn already trusts (which avoids the challenge a first sign-in from a
+datacenter address usually triggers), and answering a challenge at a prompt.
 
 ```bash
 npm run dev
@@ -641,11 +649,11 @@ The service listens on `http://localhost:8080`, with documentation at `/docs`.
 Once the session exists, `LI_PASSWORD` can be removed from `.env` for normal
 operation — it is read only when no valid session is available.
 
-> `.sessions/` contains a live authenticated session. It is gitignored and
-> written mode `0600`. Treat it as a credential.
+> `.sessions/` contains a live session cookie jar. It is gitignored and written
+> mode `0600`. Treat it as a credential.
 
 ```bash
-npm test          # 121 unit tests, no network access required
+npm test          # 126 unit tests, no network access required
 npm run typecheck # strict tsc
 npm run build     # compile to dist/
 ```
@@ -660,10 +668,7 @@ Full reference in [`.env.example`](.env.example). The significant options:
 | `SESSION_IDENTITIES` | — | Comma-separated identity labels whose sessions live in object storage. The production form: no credential in the service configuration at all |
 | `IDENTITY_LABEL` | `primary` | Names the identity, and keys its stored session |
 | `SESSION_STATE_DIR` | `.sessions` | Where session state is persisted locally |
-| `BROWSER_PROFILE_DIR` | `.sessions/profiles` | Persistent Chromium profiles, one per identity |
 | `LI_COOKIES` | — | A captured `cookie:` header, used as a one-time bootstrap seed |
-| `ENABLE_BROWSER_FALLBACK` | `true` | The browser transport |
-| `ENABLE_HTTP_TRANSPORT` | `false` | Raw HTTP transport; see [Requests are issued from inside a browser](#requests-are-issued-from-inside-a-browser) |
 | `SCRAPE_RATE_PER_MINUTE` | `5` | New profile fetches per minute |
 | `CLIENT_RATE_PER_MINUTE` | `10` | Requests per minute per caller |
 | `GLOBAL_RATE_PER_MINUTE` | `20` | Total requests per minute |
@@ -680,17 +685,20 @@ Full reference in [`.env.example`](.env.example). The significant options:
 Deployed to a Compute Engine instance behind Caddy, which terminates TLS with
 automatically provisioned and renewed certificates.
 
-A virtual machine was chosen over a serverless runtime for three reasons
-specific to this workload:
+A virtual machine was chosen over a serverless runtime for two reasons specific
+to this workload:
 
 - **A stable egress address.** The upstream correlates a session with the
   address it was established from, so a fixed address is what the
   identity-binding design requires. Serverless runtimes egress from rotating
-  pools.
-- **A persistent volume** for session state and the Chromium profile, so a
-  redeploy does not discard the established session.
-- **A warm browser process** across requests, which removes a multi-second cold
-  start from every call.
+  address pools, which makes every request look like it came from somewhere new.
+- **A persistent volume** for the session jar, so a redeploy does not discard an
+  established session and force a sign-in — the most challenge-prone thing the
+  service does.
+
+The container is a plain `node:22-alpine` image at 289 MB. An earlier revision
+of this service bundled Chromium and came to roughly 2 GB, needed 2 GB of
+memory, and paid a multi-second browser launch on cold start.
 
 The rate limiters and identity health are per-process, so the deployment runs a
 single instance. Horizontal scaling requires moving that state to a shared store
@@ -778,21 +786,18 @@ the API.
   stale-replay failure described above, self-inflicted. This was observed
   directly during development when a local process and the deployed instance
   shared one session.
-- **Unattended sign-in can be challenged.** Automatic re-authentication works,
-  and is the normal recovery path — but the upstream challenges sign-ins from
-  unfamiliar devices and networks, which a datacenter address is by definition.
-  When that happens the service holds the browser open and reports it on
-  `/health`, so the challenge is completed by posting the code to
-  `POST /v1/admin/session/challenge` rather than by anyone touching the browser.
-  A CAPTCHA challenge cannot be answered this way and needs `npm run login`.
-  A circuit breaker suspends automatic sign-in after repeated failures, because
-  retrying a rejected credential cannot succeed and moves the account towards a
-  lockout.
-- **Cold start is slow.** The first request after a restart pays roughly 5–10
-  seconds to launch Chromium and establish the page; subsequent requests are
-  1–5 seconds. Measured: 9.9s cold, 4.8s warm.
-- **Memory.** Chromium requires roughly 300 MB resident; the instance is sized
-  accordingly.
+- **Unattended sign-in can be challenged.** Automatic sign-in works and is the
+  normal recovery path, but the upstream challenges sign-ins from unfamiliar
+  networks — which a datacenter address is by definition. When that happens the
+  service keeps the cookie jar holding the challenge and reports it on
+  `/health`; the emailed code is submitted to
+  `POST /v1/admin/session/challenge`. A CAPTCHA cannot be answered over HTTP and
+  needs a session established elsewhere and supplied via `LI_COOKIES`. A circuit
+  breaker suspends automatic sign-in after repeated failures, because retrying a
+  rejected credential cannot succeed and moves the account towards a lockout.
+- **Cold start pays for a sign-in.** The first request after a restart
+  establishes a session before it can fetch. Measured at 2.3s cold and under a
+  second warm once the session is stored.
 - **In-memory cache when object storage is unconfigured** — adequate for local
   development, not across instances.
 
@@ -806,9 +811,10 @@ the API.
   surfaces partial extraction rather than hiding it. A shape change still
   requires a code change.
 - **Automated access is actively detected.** Approaches that work today may stop
-  working. The browser transport, header fidelity and identity binding
-  substantially extend the useful life of a session, but none of it is
-  permanent.
+  working. TLS and header fidelity, cookie-rotation handling and identity
+  binding substantially extend the useful life of a session, but none of it is
+  permanent. A client that presents as a browser is still not one, and the gap
+  is measurable if someone chooses to measure it.
 
 ---
 
@@ -844,25 +850,26 @@ src/
 ├── errors.ts                     error taxonomy → HTTP status mapping
 ├── openapi.ts                    OpenAPI document generated from the Zod schemas
 ├── schema/profile.ts             the public response contract
-├── browser/
-│   ├── session.ts                persistent authenticated Chromium; in-page Voyager calls
-│   ├── session-store.ts          session persistence (filesystem + object storage)
-│   ├── login.ts                  session establishment, shared by CLI and service
-│   └── login-cli.ts              `npm run login`
 ├── linkedin/
+│   ├── http/
+│   │   ├── client.ts             Chrome-shaped transport: TLS, HTTP/2, header order
+│   │   ├── cookie-jar.ts         session-token rotation and clearance detection
+│   │   ├── login.ts              browser-free sign-in and challenge submission
+│   │   └── session.ts            session lifecycle, keepalive, circuit breaker
 │   ├── url.ts                    profile URL → identifier
-│   ├── voyager-client.ts         raw HTTP transport
-│   ├── endpoints.ts              endpoint catalogue
+│   ├── endpoints.ts              endpoint catalogue (no GraphQL queryIds)
 │   ├── normalize.ts              normalized-graph rehydration
-│   ├── scraper.ts                transports and the strategy chain
+│   ├── scraper.ts                transport and the strategy chain
 │   └── parse/
 │       ├── common.ts             dates, media, union unwrapping
 │       ├── dash-profile.ts       primary profile-graph parser
-│       ├── profile-view.ts       legacy REST parser
-│       └── dash-cards.ts         component-tree parser
+│       └── profile-view.ts       legacy REST parser
 ├── identity/
-│   ├── pool.ts                   identity rotation and health
+│   ├── pool.ts                   identity rotation, health, orchestration
 │   └── proxy.ts                  provider-agnostic proxy plumbing
+├── session/
+│   ├── store.ts                  cookie-jar persistence (filesystem + object storage)
+│   └── login-cli.ts              `npm run login`
 ├── cache/{gcs,memory}.ts         profile cache and local fallback
 ├── ratelimit/
 │   ├── sliding-window.ts         shared limiter primitives
@@ -870,3 +877,4 @@ src/
 ├── service/profile-service.ts    cache-first read path, request collapsing
 └── routes/                       HTTP layer
 ```
+

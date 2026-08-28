@@ -164,10 +164,11 @@ export const profileSchema = z.object({
 });
 
 export const sourceSchema = z.enum([
-  'browser-voyager',
-  'voyager-graphql',
+  /** The dash profile graph — one request returns the whole profile. */
+  'voyager-dash',
+  /** Legacy REST profile view. Withdrawn upstream; retained as a fallback. */
   'voyager-profile-view',
-  'browser',
+  /** Served from the cache without contacting LinkedIn. */
   'cache',
 ]);
 

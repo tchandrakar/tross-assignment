@@ -13,8 +13,8 @@ import { ProfileScraper } from './linkedin/scraper.js';
 import { ScrapeLimiter } from './ratelimit/scrape-limiter.js';
 import { KeyedSlidingWindowLimiter, SlidingWindowLimiter } from './ratelimit/sliding-window.js';
 import { ProfileService } from './service/profile-service.js';
-import { BrowserSession } from './browser/session.js';
-import { FileSessionStore, GcsSessionStore, type SessionStore } from './browser/session-store.js';
+import { HttpSessionManager } from './linkedin/http/session.js';
+import { FileSessionStore, GcsSessionStore, type SessionStore } from './session/store.js';
 import { Storage } from '@google-cloud/storage';
 import { registerProfileRoutes } from './routes/profile.js';
 import { registerHealthRoutes } from './routes/health.js';
@@ -55,7 +55,7 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
   const clientLimiter = new KeyedSlidingWindowLimiter(config.clientRatePerMinute);
 
   // Persisted browser state is what lets us follow LinkedIn's li_at rotation
-  // instead of replaying a stale token — see browser/session-store.ts.
+  // instead of replaying a stale token — see session/store.ts.
   const sessionStore: SessionStore = config.gcsBucket
     ? new GcsSessionStore(new Storage(), config.gcsBucket)
     : new FileSessionStore(config.sessionStateDir);
@@ -65,10 +65,10 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
       ? { email: config.loginEmail, password: config.loginPassword }
       : null;
 
-  const browserSession = config.enableBrowserFallback
-    ? new BrowserSession(app.log, sessionStore, credentials, config.browserProfileDir)
-    : null;
-  const scraper = new ProfileScraper(pool, app.log, browserSession, config.enableHttpTransport);
+  // One session manager, one transport: direct HTTP to LinkedIn. No browser is
+  // launched anywhere in this service.
+  const sessions = new HttpSessionManager(app.log, sessionStore, credentials);
+  const scraper = new ProfileScraper(pool, app.log, sessions);
   const service = new ProfileService(scraper, cache, limiter, config, app.log);
 
   registerApiKeyAuth(app, config);
@@ -81,15 +81,8 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
   });
   await app.register(swaggerUi, { routePrefix: '/docs', uiConfig: { docExpansion: 'list' } });
 
-  registerHealthRoutes(app, { pool, cache, limiter, globalLimiter, clientLimiter, startedAt, browserSession });
+  registerHealthRoutes(app, { pool, cache, limiter, globalLimiter, clientLimiter, startedAt, sessions });
   registerProfileRoutes(app, service);
-
-  if (!browserSession && !config.enableHttpTransport) {
-    throw new Error(
-      'No extraction transport is enabled: ENABLE_BROWSER_FALLBACK and ENABLE_HTTP_TRANSPORT are both false. ' +
-        'Enable at least one, or the service can never fetch a profile.',
-    );
-  }
 
   if (pool.size === 0) {
     app.log.warn(
@@ -102,7 +95,7 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
     app,
     config,
     shutdown: async () => {
-      await browserSession?.close();
+      await sessions.close();
       await app.close();
     },
   };

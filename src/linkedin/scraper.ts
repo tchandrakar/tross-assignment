@@ -3,20 +3,12 @@ import { ApiError } from '../errors.js';
 import type { Identity, IdentityPool } from '../identity/pool.js';
 import type { Profile, ScrapeSource } from '../schema/profile.js';
 import { profileSchema } from '../schema/profile.js';
-import { VoyagerClient } from './voyager-client.js';
 import { normalize, resolveGraph } from './normalize.js';
-import type { BrowserSession } from '../browser/session.js';
-import {
-  dashProfileByVanityPath, profileNetworkInfoPath, profileViewPath, publicProfileUrl,
-} from './endpoints.js';
+import type { HttpSessionManager } from './http/session.js';
+import { dashProfileByVanityPath, profileViewPath, publicProfileUrl } from './endpoints.js';
 import { parseProfileView } from './parse/profile-view.js';
 import { parseDashProfile } from './parse/dash-profile.js';
-import {
-  collectEntities, entityToCertification, entityToEducation, entityToExperience,
-  entityToHonor, entityToLanguage, entityToProject, entityToPublication, entityToSkill,
-  entityToVolunteer, type CardEntity,
-} from './parse/dash-cards.js';
-import { attributedText, get, isObject, num, parseVectorImage, pick, str } from './parse/common.js';
+import { isObject, num, pick, str } from './parse/common.js';
 
 export interface ScrapeResult {
   profile: Profile;
@@ -29,30 +21,38 @@ export interface ScrapeResult {
  * transport — raw HTTP versus a fetch issued from inside a real authenticated
  * Chromium page — so every parser and every extraction routine is shared.
  */
+/**
+ * How a Voyager request is made. One implementation today — plain HTTP — but the
+ * seam is kept because the strategy chain below is written against it, and a
+ * second source (a replay fixture, a different endpoint family) slots in without
+ * touching the parsers.
+ */
 export interface Transport {
   readonly source: ScrapeSource;
-  /**
-   * `publicId` is the profile being scraped. The browser transport uses it to
-   * land on that profile's page before issuing in-page calls, so one navigation
-   * both establishes the session and puts us on a same-origin, on-topic page.
-   */
   fetch(path: string, identity: Identity, publicId: string): Promise<unknown>;
 }
 
+/**
+ * The only transport: direct HTTP calls to LinkedIn's Voyager endpoints.
+ *
+ * No browser is involved anywhere in this service. What makes that viable is
+ * covered in http/client.ts (TLS, HTTP/2 and header shaping) and
+ * http/cookie-jar.ts (following session-token rotation).
+ */
 export class HttpTransport implements Transport {
-  readonly source = 'voyager-graphql' as const;
-  constructor(private readonly client: VoyagerClient) {}
-  async fetch(path: string, identity: Identity): Promise<unknown> {
-    return (await this.client.get({ path, identity })).body;
-  }
+  readonly source = 'voyager-dash' as const;
 
-}
+  constructor(private readonly sessions: HttpSessionManager) {}
 
-export class BrowserTransport implements Transport {
-  readonly source = 'browser-voyager' as const;
-  constructor(private readonly session: BrowserSession) {}
   async fetch(path: string, identity: Identity, publicId: string): Promise<unknown> {
-    return (await this.session.fetchVoyager(identity, path, publicProfileUrl(publicId))).body;
+    const response = await this.sessions.fetchVoyager(identity, path, publicProfileUrl(publicId));
+    try {
+      return response.body ? JSON.parse(response.body) : null;
+    } catch {
+      throw new ApiError('PARSE_FAILED', `LinkedIn returned a non-JSON body for ${path}.`, {
+        details: { status: response.status, preview: response.body.slice(0, 200) },
+      });
+    }
   }
 }
 
@@ -62,59 +62,41 @@ interface Strategy {
 }
 
 /**
- * Runs extraction strategies in order and stops at the first that returns a
- * profile with a name on it.
+ * Runs extraction strategies in order; the first to return a profile with a
+ * name wins.
  *
- *   1. browser-voyager      — Voyager API called from inside a real browser page.
- *                             Same JSON, same parsers; the transport carries
- *                             Chrome's true TLS fingerprint and cookie jar.
- *   2. voyager-graphql      — the same dash calls over raw HTTP. Faster and much
- *                             cheaper, but far easier for LinkedIn to fingerprint.
- *   3. voyager-profile-view — legacy REST. 410 Gone as of 2026-08; kept because
- *                             it costs one call and is the richest single response
- *                             wherever it still works.
- *   4. browser              — harvest payloads from the rendered profile page.
+ *   1. voyager-dash        the dash profile graph. One request returns the whole
+ *                          profile — positions, education, skills, certifications,
+ *                          languages — addressed by decorationId rather than a
+ *                          rotating GraphQL queryId.
+ *   2. voyager-profile-view legacy REST. Returned every section in one call and
+ *                          took no queryId. Withdrawn upstream (410 Gone), kept
+ *                          because it costs one request to try and 410 is
+ *                          unambiguous.
  *
  * Failure handling distinguishes three cases, and the distinction is
  * load-bearing:
- *   - blocked (999/429/403/401) → abort the chain. Trying another strategy on an
+ *   - blocked (999/429/403/401) → abort. Trying another strategy with an
  *     identity LinkedIn just flagged only deepens the block.
- *   - endpoint retired (410)    → fall through at once; the identity is healthy.
+ *   - endpoint withdrawn (410)  → fall through at once; the identity is healthy.
  *   - parse failure             → fall through to the next strategy.
  */
 export class ProfileScraper {
-  private readonly client: VoyagerClient;
-  private readonly httpTransport: HttpTransport;
-  private readonly browserTransport: BrowserTransport | null;
+  private readonly transport: HttpTransport;
 
   constructor(
     private readonly pool: IdentityPool,
     private readonly logger: FastifyBaseLogger,
-    private readonly browser: BrowserSession | null,
-    private readonly enableHttpTransport = false,
+    private readonly sessions: HttpSessionManager,
   ) {
-    this.client = new VoyagerClient(pool);
-    this.httpTransport = new HttpTransport(this.client);
-    this.browserTransport = browser ? new BrowserTransport(browser) : null;
+    this.transport = new HttpTransport(sessions);
   }
 
   async scrape(publicId: string): Promise<ScrapeResult> {
-    const strategies: Strategy[] = [];
-
-    if (this.browserTransport) {
-      strategies.push({ name: 'browser-voyager', run: (id) => this.viaDash(id, this.browserTransport!) });
-    }
-    // Raw HTTP is opt-in: it makes the same calls, but LinkedIn fingerprints
-    // the client and answers by killing the session. See config.ENABLE_HTTP_TRANSPORT.
-    if (this.enableHttpTransport) {
-      strategies.push(
-        { name: 'voyager-graphql', run: (id) => this.viaDash(id, this.httpTransport) },
-        { name: 'voyager-profile-view', run: (id) => this.viaProfileView(id) },
-      );
-    }
-    if (this.browser) {
-      strategies.push({ name: 'browser', run: (id) => this.viaRenderedPage(id) });
-    }
+    const strategies: Strategy[] = [
+      { name: 'voyager-dash', run: (id) => this.viaDash(id, this.transport) },
+      { name: 'voyager-profile-view', run: (id) => this.viaProfileView(id) },
+    ];
 
     const failures: string[] = [];
 
@@ -133,7 +115,7 @@ export class ProfileScraper {
           if (error.code === 'PROFILE_NOT_FOUND' || error.code === 'NO_IDENTITY_AVAILABLE') throw error;
 
           if (error.code === 'ENDPOINT_RETIRED') {
-            this.logger.debug({ strategy: strategy.name }, 'endpoint retired by LinkedIn, falling through');
+            this.logger.debug({ strategy: strategy.name }, 'endpoint withdrawn upstream, falling through');
             failures.push(`${strategy.name}: retired (410)`);
             continue;
           }
@@ -159,14 +141,14 @@ export class ProfileScraper {
   // ─── Dash profile + cards, over either transport ───────────────────────────
 
   private async viaDash(publicId: string, transport: Transport): Promise<ScrapeResult> {
-    return this.client.withIdentity(async (identity) => {
+    return this.pool.run(async (identity) => {
       const body = await transport
         .fetch(dashProfileByVanityPath(publicId), identity, publicId)
         .catch(async (error: unknown) => {
           // A dead session's persisted state must be discarded, or every retry
           // replays the same dead token.
           if (error instanceof ApiError && error.code === 'AUTH_FAILED') {
-            await this.browser?.invalidate(identity);
+            await this.sessions.invalidate(identity);
           }
           throw error;
         });
@@ -207,22 +189,14 @@ export class ProfileScraper {
   // ─── Legacy profileView ────────────────────────────────────────────────────
 
   private async viaProfileView(publicId: string): Promise<ScrapeResult> {
-    return this.client.withIdentity(async (identity) => {
-      const response = await this.client.get({ path: profileViewPath(publicId), identity });
-      const { data } = normalize(response.body);
+    return this.pool.run(async (identity) => {
+      // Goes through the same authenticated transport as everything else. An
+      // earlier revision used a separate client that carried no cookie jar,
+      // so this strategy 403'd and — because a block aborts the chain — took
+      // the whole request down with it.
+      const body = await this.transport.fetch(profileViewPath(publicId), identity, publicId);
+      const { data } = normalize(body);
       const { profile, missingSections } = parseProfileView(data);
-
-      // profileView omits network counts. Failure here must not fail the scrape.
-      // (This endpoint is also 410 as of 2026-08 — counts come from dash instead.)
-      let connectionCount: number | null = null;
-      let followerCount: number | null = null;
-      try {
-        const network = normalize((await this.client.get({ path: profileNetworkInfoPath(publicId), identity })).body).data;
-        connectionCount = num(pick(network, 'connectionsCount', 'connections.paging.total'));
-        followerCount = num(pick(network, 'followersCount', 'followerCount'));
-      } catch (error) {
-        this.logger.debug({ err: error, publicId }, 'networkinfo lookup failed; counts will be null');
-      }
 
       return {
         source: 'voyager-profile-view' as const,
@@ -231,161 +205,8 @@ export class ProfileScraper {
           ...profile,
           publicId,
           profileUrl: publicProfileUrl(publicId),
-          connectionCount,
-          followerCount,
         }),
       };
     });
   }
-
-  // ─── Rendered page harvest ─────────────────────────────────────────────────
-
-  private async viaRenderedPage(publicId: string): Promise<ScrapeResult> {
-    if (!this.browser) throw new ApiError('PARSE_FAILED', 'Browser fallback is disabled.');
-
-    return this.client.withIdentity(async (identity) => {
-      const payloads = await this.browser!.collectRenderedPayloads(identity, publicId);
-      return selectBestPayload(payloads, publicId, this.logger);
-    });
-  }
-}
-
-// ─── Card grouping ───────────────────────────────────────────────────────────
-
-/**
- * Cards identify their section through an urn that names it, e.g.
- *   urn:li:fsd_profileCard:(ACoAAB…,EXPERIENCE,en_US)
- */
-const SECTION_ALIASES: Record<string, string> = {
-  EXPERIENCE: 'experience',
-  EDUCATION: 'education',
-  SKILLS: 'skills',
-  LICENSES_AND_CERTIFICATIONS: 'certifications',
-  CERTIFICATIONS: 'certifications',
-  LANGUAGES: 'languages',
-  PROJECTS: 'projects',
-  PUBLICATIONS: 'publications',
-  HONORS_AND_AWARDS: 'honors',
-  VOLUNTEERING_EXPERIENCE: 'volunteering',
-};
-
-export function groupCardsBySection(cards: unknown): Map<string, CardEntity[]> {
-  const grouped = new Map<string, CardEntity[]>();
-  const elements = Array.isArray(get(cards, 'elements')) ? (get(cards, 'elements') as unknown[]) : [];
-
-  for (const card of elements) {
-    const urn = str(pick(card, 'entityUrn', 'cardUrn')) ?? '';
-    const sectionKey = Object.keys(SECTION_ALIASES).find((k) => urn.includes(k));
-    if (!sectionKey) continue;
-
-    const section = SECTION_ALIASES[sectionKey]!;
-    const entities = collectEntities(pick(card, 'topComponents', 'components'));
-    grouped.set(section, [...(grouped.get(section) ?? []), ...entities]);
-  }
-
-  return grouped;
-}
-
-export function parseCards(cards: unknown) {
-  const grouped = groupCardsBySection(cards);
-  const missing: string[] = [];
-
-  const take = <T>(key: string, mapper: (e: CardEntity) => T): T[] => {
-    const entities = grouped.get(key) ?? [];
-    if (entities.length === 0) missing.push(key);
-    return entities.map(mapper);
-  };
-
-  const experienceEntities = grouped.get('experience') ?? [];
-  if (experienceEntities.length === 0) missing.push('experience');
-
-  return {
-    missing,
-    parsed: {
-      experience: experienceEntities.flatMap(flattenRoles),
-      education: take('education', entityToEducation),
-      skills: take('skills', entityToSkill).filter((s) => s.name.length > 0),
-      certifications: take('certifications', entityToCertification),
-      languages: take('languages', entityToLanguage).filter((l) => l.name.length > 0),
-      projects: take('projects', entityToProject),
-      publications: take('publications', entityToPublication),
-      honors: take('honors', entityToHonor),
-      volunteering: take('volunteering', entityToVolunteer),
-    },
-  };
-}
-
-/**
- * LinkedIn groups several roles at the same employer under one company entity:
- * the outer entity carries the company (and combined tenure), each child a job
- * title. Flatten those into standalone records so a caller never has to know
- * about the nesting — the child's title wins, the parent's company is inherited.
- */
-export function flattenRoles(entity: CardEntity): ReturnType<typeof entityToExperience>[] {
-  if (entity.children.length === 0) return [entityToExperience(entity)];
-
-  const parent = entityToExperience(entity);
-  // In the grouped layout the outer title is the company name, not a job title.
-  const company = parent.company ?? entity.title;
-
-  return entity.children.map((child) => {
-    const role = entityToExperience(child);
-    return {
-      ...role,
-      company: company ?? role.company,
-      companyLinkedinUrl: role.companyLinkedinUrl ?? parent.companyLinkedinUrl,
-      companyLogo: role.companyLogo ?? parent.companyLogo,
-      // A nested role's subtitle holds the employment type, not the employer.
-      employmentType: role.employmentType ?? (child.subtitle || null),
-    };
-  });
-}
-
-// ─── Rendered-payload selection ──────────────────────────────────────────────
-
-/**
- * Payloads harvested from a rendered page arrive in arbitrary order and most
- * are unrelated (nav, ads, messaging), so score rather than assume.
- */
-export function selectBestPayload(payloads: unknown[], publicId: string, logger: FastifyBaseLogger): ScrapeResult {
-  let best: { score: number; result: ScrapeResult } | null = null;
-
-  for (const payload of payloads) {
-    let data: unknown;
-    try {
-      data = normalize(payload).data;
-    } catch {
-      continue;
-    }
-
-    const candidate = looksLikeProfileView(data) ? data : looksLikeProfileView(payload) ? payload : null;
-    if (!candidate) continue;
-
-    try {
-      const { profile, missingSections } = parseProfileView(candidate);
-      const parsed = profileSchema.parse({ ...profile, publicId, profileUrl: publicProfileUrl(publicId) });
-
-      const score =
-        (parsed.fullName ? 4 : 0) + parsed.experience.length + parsed.education.length + parsed.skills.length;
-
-      if (!best || score > best.score) {
-        best = { score, result: { profile: parsed, source: 'browser', missingSections } };
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  if (!best || best.score === 0) {
-    throw new ApiError('PARSE_FAILED', 'The rendered page contained no recognisable profile payload.', {
-      details: { publicId, payloadsInspected: payloads.length },
-    });
-  }
-
-  logger.debug({ publicId, score: best.score }, 'selected best rendered payload');
-  return best.result;
-}
-
-function looksLikeProfileView(data: unknown): boolean {
-  return isObject(data) && ('positionView' in data || 'educationView' in data || 'profile' in data);
 }

@@ -2,11 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtemp, rm, readFile, writeFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FileSessionStore, NullSessionStore } from '../src/browser/session-store.js';
+import { FileSessionStore, NullSessionStore } from '../src/session/store.js';
 
 const state = (names: string[]) => ({
-  cookies: names.map((name) => ({ name, value: `${name}-value`, domain: '.linkedin.com', path: '/' })),
-  origins: [],
+  cookies: Object.fromEntries(names.map((name) => [name, `${name}-value`])),
+  updatedAt: new Date().toISOString(),
 });
 
 describe('FileSessionStore', () => {
@@ -22,7 +22,7 @@ describe('FileSessionStore', () => {
   it('round-trips a session', async () => {
     await store.save('primary', state(['li_at', 'JSESSIONID']) as never);
     const loaded = await store.load('primary');
-    expect(loaded?.cookies).toHaveLength(2);
+    expect(Object.keys(loaded?.cookies ?? {})).toHaveLength(2);
   });
 
   it('returns null for an identity that has never been saved', async () => {
@@ -38,15 +38,15 @@ describe('FileSessionStore', () => {
   it('keys identities separately', async () => {
     await store.save('a', state(['li_at']) as never);
     await store.save('b', state(['li_at', 'JSESSIONID', 'lidc']) as never);
-    expect((await store.load('a'))?.cookies).toHaveLength(1);
-    expect((await store.load('b'))?.cookies).toHaveLength(3);
+    expect(Object.keys((await store.load('a'))?.cookies ?? {})).toHaveLength(1);
+    expect(Object.keys((await store.load('b'))?.cookies ?? {})).toHaveLength(3);
   });
 
   it('treats an empty cookie jar as no session, so the caller re-establishes', async () => {
     // The bug this guards: clear() used to blank the file, and load() accepted
     // it, so a dead session became an unauthenticated request loop instead of
     // triggering a re-login.
-    await writeFile(join(dir, 'primary.json'), JSON.stringify({ cookies: [], origins: [] }));
+    await writeFile(join(dir, 'primary.json'), JSON.stringify({ cookies: {} }));
     expect(await store.load('primary')).toBeNull();
   });
 
@@ -65,7 +65,7 @@ describe('FileSessionStore', () => {
     await store.save('primary', state(['li_at']) as never);
     await store.save('primary', state(['li_at', 'lidc']) as never);
     const raw = JSON.parse(await readFile(join(dir, 'primary.json'), 'utf8'));
-    expect(raw.cookies).toHaveLength(2);
+    expect(Object.keys(raw.cookies)).toHaveLength(2);
   });
 
   it('sanitises the identity id so it cannot escape the directory', async () => {

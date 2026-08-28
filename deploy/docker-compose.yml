@@ -18,15 +18,12 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       SESSION_IDENTITIES: ${SESSION_IDENTITIES:-primary}
       SESSION_STATE_DIR: /app/.sessions
-      BROWSER_PROFILE_DIR: /app/.sessions/profiles
       GCS_BUCKET: ${GCS_BUCKET}
       CACHE_ENABLED: ${CACHE_ENABLED:-true}
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-604800}
       SCRAPE_RATE_PER_MINUTE: ${SCRAPE_RATE_PER_MINUTE:-5}
       CLIENT_RATE_PER_MINUTE: ${CLIENT_RATE_PER_MINUTE:-10}
       GLOBAL_RATE_PER_MINUTE: ${GLOBAL_RATE_PER_MINUTE:-20}
-      ENABLE_BROWSER_FALLBACK: "true"
-      ENABLE_HTTP_TRANSPORT: "false"
       # Credentials for automatic session bootstrap. The service uses them only
       # when it has no valid stored session — normally never, because the
       # session in GCS survives redeploys.
@@ -36,13 +33,11 @@ services:
       PROXY_URLS: ${PROXY_URLS:-}
       PROXY_STICKY_TEMPLATE: ${PROXY_STICKY_TEMPLATE:-}
     volumes:
-      # Holds both the session state and the persistent Chromium profiles.
-      # This volume is what keeps the browser recognised as the same device
-      # across redeploys, so the service does not have to log in again — and
-      # logging in is the most CAPTCHA-prone thing it can do.
+      # Holds the session cookie jar, including whatever session token LinkedIn
+      # most recently rotated to. Persisting it across restarts is what avoids
+      # an unnecessary sign-in, which is the most challenge-prone thing this
+      # service does.
       - session-state:/app/.sessions
-    # Chromium needs more than the default 64MB of shared memory.
-    shm_size: 1gb
     expose:
       - "8080"
     healthcheck:

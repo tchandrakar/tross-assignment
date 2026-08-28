@@ -29,7 +29,7 @@ export interface Identity {
    * Stable across restarts — derived from the label, not random. Persisted
    * browser session state is keyed on this, so a per-process id would orphan
    * the stored session on every deploy and silently reintroduce stale-token
-   * replay (see browser/session-store.ts).
+   * replay (see session/store.ts).
    */
   readonly id: string;
   readonly label: string;
@@ -142,6 +142,41 @@ export class IdentityPool {
     if (identity.consecutiveFailures >= QUARANTINE_AFTER_FAILURES) {
       identity.quarantined = true;
     }
+  }
+
+  /**
+   * Runs `fn` against a healthy identity, retrying on a *different* identity
+   * when the current one is blocked. Health accounting happens here so callers
+   * never have to remember to report it.
+   *
+   * Only a genuine upstream rejection warrants trying another identity. A parse
+   * failure is our problem, not the identity's, and retrying it elsewhere would
+   * spend a second identity to get the same result.
+   */
+  async run<T>(fn: (identity: Identity) => Promise<T>): Promise<T> {
+    // At least one attempt even on an empty pool, so `acquire()` runs and
+    // reports the accurate NO_IDENTITY_AVAILABLE rather than a generic block.
+    const attempts = Math.max(1, Math.min(this.size, 3));
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const identity = this.acquire();
+      try {
+        const result = await fn(identity);
+        this.reportSuccess(identity);
+        return result;
+      } catch (error) {
+        lastError = error;
+        const blocked =
+          error instanceof ApiError && (error.code === 'UPSTREAM_BLOCKED' || error.code === 'AUTH_FAILED');
+        this.reportFailure(identity, blocked);
+        if (!blocked) throw error;
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new ApiError('UPSTREAM_BLOCKED', 'LinkedIn blocked every available identity.');
   }
 
   /** Manual recovery hook — exposed via the admin health endpoint. */

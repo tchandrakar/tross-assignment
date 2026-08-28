@@ -30,10 +30,13 @@ export interface SessionStore {
   clear(identityId: string): Promise<void>;
 }
 
-/** Playwright's storageState shape — kept structural rather than importing it. */
+/**
+ * What is persisted: the cookie jar, including whatever session token LinkedIn
+ * most recently rotated to.
+ */
 export interface StorageState {
-  cookies: Array<Record<string, unknown>>;
-  origins: Array<Record<string, unknown>>;
+  cookies: Record<string, string>;
+  updatedAt?: string;
 }
 
 /** Local-disk store. Path is gitignored; the file contains a live session. */
@@ -52,7 +55,7 @@ export class FileSessionStore implements SessionStore {
       const parsed = JSON.parse(raw) as StorageState;
       // An empty jar is not a session — treat it as absent so the caller
       // re-establishes rather than making an unauthenticated request.
-      return Array.isArray(parsed?.cookies) && parsed.cookies.length > 0 ? parsed : null;
+      return hasCookies(parsed) ? parsed : null;
     } catch {
       return null;
     }
@@ -94,7 +97,7 @@ export class GcsSessionStore implements SessionStore {
     try {
       const [buffer] = await this.file(identityId).download();
       const parsed = JSON.parse(buffer.toString('utf8')) as StorageState;
-      return Array.isArray(parsed?.cookies) && parsed.cookies.length > 0 ? parsed : null;
+      return hasCookies(parsed) ? parsed : null;
     } catch (error) {
       if ((error as { code?: number }).code === 404) return null;
       throw error;
@@ -112,6 +115,11 @@ export class GcsSessionStore implements SessionStore {
   async clear(identityId: string): Promise<void> {
     await this.file(identityId).delete().catch(() => undefined);
   }
+}
+
+function hasCookies(value: unknown): value is StorageState {
+  const cookies = (value as StorageState | null)?.cookies;
+  return typeof cookies === 'object' && cookies !== null && Object.keys(cookies).length > 0;
 }
 
 /** No-op store, for tests and for explicitly stateless runs. */

@@ -160,3 +160,53 @@ describe('IdentityPool.release', () => {
     expect(byLabel.b).toBe('cooling-down');
   });
 });
+
+describe('IdentityPool.run', () => {
+  it('reports NO_IDENTITY_AVAILABLE on an empty pool rather than a generic block', async () => {
+    const pool = new IdentityPool(baseConfig());
+    await expect(pool.run(async () => 'never')).rejects.toMatchObject({ code: 'NO_IDENTITY_AVAILABLE' });
+  });
+
+  it('retries a blocked call on a different identity', async () => {
+    const pool = new IdentityPool(baseConfig({ identities: [identity('a'), identity('b')] }));
+    const seen: string[] = [];
+
+    const result = await pool.run(async (id) => {
+      seen.push(id.label);
+      if (seen.length === 1) throw new ApiError('UPSTREAM_BLOCKED', 'flagged');
+      return 'ok';
+    });
+
+    expect(result).toBe('ok');
+    expect(seen).toEqual(['a', 'b']);
+  });
+
+  it('does not retry a parse failure — that is our bug, not the identity\'s', async () => {
+    const pool = new IdentityPool(baseConfig({ identities: [identity('a'), identity('b')] }));
+    let calls = 0;
+
+    await expect(
+      pool.run(async () => {
+        calls += 1;
+        throw new ApiError('PARSE_FAILED', 'bad json');
+      }),
+    ).rejects.toMatchObject({ code: 'PARSE_FAILED' });
+
+    expect(calls).toBe(1);
+  });
+
+  it('cools down the identity that was blocked', async () => {
+    const pool = new IdentityPool(baseConfig({ identities: [identity('a'), identity('b')] }));
+    await pool
+      .run(async () => { throw new ApiError('UPSTREAM_BLOCKED', 'flagged'); })
+      .catch(() => undefined);
+
+    expect(pool.health().filter((h) => h.state === 'cooling-down').length).toBeGreaterThan(0);
+  });
+
+  it('clears failure state after a success', async () => {
+    const pool = new IdentityPool(baseConfig({ identities: [identity('a')] }));
+    await pool.run(async () => 'ok');
+    expect(pool.health()[0]).toMatchObject({ state: 'available', consecutiveFailures: 0 });
+  });
+});

@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import type { ProfileCache } from '../cache/index.js';
 import type { IdentityPool } from '../identity/pool.js';
 import type { ScrapeLimiter } from '../ratelimit/scrape-limiter.js';
-import type { BrowserSession } from '../browser/session.js';
+import type { HttpSessionManager } from '../linkedin/http/session.js';
 import { ApiError } from '../errors.js';
 import type { KeyedSlidingWindowLimiter, SlidingWindowLimiter } from '../ratelimit/sliding-window.js';
 
@@ -19,7 +19,7 @@ export function registerHealthRoutes(
     globalLimiter: SlidingWindowLimiter;
     clientLimiter: KeyedSlidingWindowLimiter;
     startedAt: number;
-    browserSession: BrowserSession | null;
+    sessions: HttpSessionManager;
   },
 ): void {
   app.get('/health', async () => {
@@ -48,12 +48,12 @@ export function registerHealthRoutes(
       cache: { kind: deps.cache.kind, healthy: cacheHealthy },
       // A session that is open and recently touched is one that will not need
       // to log in again — which is the whole point of keeping it warm.
-      browserSessions: deps.browserSession?.stats() ?? [],
+      sessions: deps.sessions.stats(),
       // Non-empty means automatic login is failing and may need operator action.
-      loginHealth: deps.browserSession?.loginHealth() ?? [],
+      loginHealth: deps.sessions.loginHealth(),
       // Non-empty means LinkedIn is waiting on a verification code. Submit it
       // to POST /v1/admin/session/challenge to finish authenticating.
-      pendingChallenges: deps.browserSession?.challenges() ?? [],
+      pendingChallenges: deps.sessions.challengeState(),
       identities,
     };
   });
@@ -68,10 +68,7 @@ export function registerHealthRoutes(
    * after a timeout or a redeploy. Protected by the API key when one is set.
    */
   app.post('/v1/admin/session/reset', async () => {
-    if (!deps.browserSession) {
-      return { success: true as const, cleared: [], identitiesReleased: deps.pool.release() };
-    }
-    const { cleared } = await deps.browserSession.resetLoginBreaker();
+    const { cleared } = await deps.sessions.resetLoginBreaker();
     // Same reasoning as the challenge endpoint: a reset is an operator saying
     // "the cause is fixed", so accumulated backoff should not outlive it.
     const released = deps.pool.release();
@@ -85,16 +82,12 @@ export function registerHealthRoutes(
    * endpoint delivers it without anyone needing access to the browser itself.
    */
   app.post<{ Body: { code?: string; identity?: string } }>('/v1/admin/session/challenge', async (request) => {
-    if (!deps.browserSession) {
-      throw new ApiError('AUTH_FAILED', 'The browser transport is disabled, so there can be no pending challenge.');
-    }
-
     const code = (request.body?.code ?? '').trim();
     if (!/^[0-9]{4,8}$/.test(code)) {
       throw new ApiError('INVALID_URL', 'Body must be {"code":"123456"} — a 4 to 8 digit verification code.');
     }
 
-    const result = await deps.browserSession.submitChallengeCode(code, request.body?.identity);
+    const result = await deps.sessions.submitChallengeCode(code, request.body?.identity);
 
     // Release identity cooldowns too. The backoff was accumulated by the very
     // failures this challenge has just resolved; leaving it in place would keep
