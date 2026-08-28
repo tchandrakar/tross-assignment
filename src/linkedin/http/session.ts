@@ -69,6 +69,12 @@ export class HttpSessionManager {
     private readonly logger: FastifyBaseLogger,
     private readonly store: SessionStore = new NullSessionStore(),
     private readonly credentials: { email: string; password: string } | null = null,
+    /**
+     * Whether this instance may sign in by itself. Off in production: a
+     * datacenter sign-in is challenged nearly every time, and repeated
+     * challenged sign-ins are what gets an account restricted.
+     */
+    private readonly allowAutoLogin = false,
   ) {}
 
   // ─── Requests ──────────────────────────────────────────────────────────────
@@ -222,6 +228,16 @@ export class HttpSessionManager {
   // ─── Sign-in ───────────────────────────────────────────────────────────────
 
   private async signIn(identity: Identity): Promise<CookieJar> {
+    if (!this.allowAutoLogin) {
+      throw new ApiError(
+        'AUTH_FAILED',
+        `Identity "${identity.label}" has no valid session, and automatic sign-in is disabled. ` +
+          'Establish a session with `npm run login` from a trusted network and upload it, ' +
+          'or set ALLOW_AUTO_LOGIN=true to let this instance sign in itself.',
+        { details: { identity: identity.label, needsHuman: true, autoLoginDisabled: true } },
+      );
+    }
+
     if (!this.credentials) {
       throw new ApiError(
         'AUTH_FAILED',

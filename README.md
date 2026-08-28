@@ -464,6 +464,7 @@ Strategies run in order; the first to return a profile with a name wins.
 |---|---|---|
 | 1 | `voyager-dash` | The profile graph. **One request returns the whole profile**, addressed by `decorationId` rather than a rotating GraphQL `queryId` |
 | 2 | `voyager-profile-view` | Legacy REST. Returned every section in one call and took no identifier of any kind. **Withdrawn upstream — `410 Gone`**, retained because it costs one request to try and `410` is unambiguous |
+| 3 | `public` | The public profile page, **no session at all**. Runs only when the authenticated path is unavailable. Substantially reduced — see below |
 
 Failure handling distinguishes **three** cases, and the distinction is
 load-bearing:
@@ -479,6 +480,42 @@ Collapsing the first two is a genuine defect, and this codebase had it: `410`
 initially fell into the generic `>= 300` branch and was reported as
 `AUTH_FAILED`, which aborted the chain and made a withdrawn endpoint
 indistinguishable from an expired credential.
+
+### The unauthenticated fallback
+
+When no session is available, the service reads the public profile page instead
+of failing. LinkedIn embeds a schema.org `Person` as `application/ld+json` on
+every public profile, served without authentication.
+
+It is marked, not disguised: `meta.source` is `public` and every unavailable
+field appears in `meta.missingSections`, so a consumer can always tell degraded
+data from complete data.
+
+Two limits, both material:
+
+**Most free text is masked.** LinkedIn replaces it with asterisks for logged-out
+viewers:
+
+```json
+"jobTitle": ["*** ******* ******* * *********"],
+"worksFor": [{ "name": "***", "location": "Ahmedabad, Gujarat, India" }]
+```
+
+A masked value carries no information, so it is reported as `null` rather than
+passed through — returning the asterisks would be worse than returning nothing,
+because a consumer would store them as the member's actual job title.
+
+**Guest access is per-profile.** LinkedIn serves public figures and
+SEO-indexed profiles to logged-out clients and answers `999` for many ordinary
+ones. Measured from the deployment: `williamhgates` returns a full document,
+another profile returns `999` from the same address seconds later. So the
+fallback helps for some profiles and not others, and that is not something the
+client controls.
+
+What does survive: name, location, profile image, follower count, employer and
+school names where unmasked, year-precision date ranges, languages and awards.
+What never does: the summary, skills, certifications, projects, publications and
+volunteering.
 
 ### Read path
 
@@ -669,6 +706,8 @@ Full reference in [`.env.example`](.env.example). The significant options:
 | `IDENTITY_LABEL` | `primary` | Names the identity, and keys its stored session |
 | `SESSION_STATE_DIR` | `.sessions` | Where session state is persisted locally |
 | `LI_COOKIES` | — | A captured `cookie:` header, used as a one-time bootstrap seed |
+| `ALLOW_AUTO_LOGIN` | `false` | Whether the instance may sign in itself. See [Session handling](#following-session-token-rotation) |
+| `ENABLE_PUBLIC_FALLBACK` | `true` | Fall back to the public page when no session is available |
 | `SCRAPE_RATE_PER_MINUTE` | `5` | New profile fetches per minute |
 | `CLIENT_RATE_PER_MINUTE` | `10` | Requests per minute per caller |
 | `GLOBAL_RATE_PER_MINUTE` | `20` | Total requests per minute |
@@ -781,6 +820,13 @@ the API.
 - **Single instance.** Rate limiters and identity health live in process memory,
   so the configured limits are only accurate for one instance. Horizontal
   scaling requires moving that state to Redis first.
+- **Sign-ins are the risk, not requests.** A sign-in from a datacenter address
+  is challenged nearly every time, and repeated challenged sign-ins are what
+  gets an account restricted — as happened to the account used during
+  development. The service therefore does **not** sign in by itself unless
+  `ALLOW_AUTO_LOGIN=true`; it expects a session established from a trusted
+  network and uploaded. Fetching profiles with an established session is far
+  less risky than establishing one.
 - **One process per session.** Two instances sharing stored session state would
   rotate the upstream token out from under each other — the same
   stale-replay failure described above, self-inflicted. This was observed

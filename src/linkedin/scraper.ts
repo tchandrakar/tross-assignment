@@ -8,6 +8,8 @@ import type { HttpSessionManager } from './http/session.js';
 import { dashProfileByVanityPath, profileViewPath, publicProfileUrl } from './endpoints.js';
 import { parseProfileView } from './parse/profile-view.js';
 import { parseDashProfile } from './parse/dash-profile.js';
+import { parsePublicProfile } from './parse/public-profile.js';
+import { fetchPublicProfile } from './http/public.js';
 import { isObject, num, pick, str } from './parse/common.js';
 
 export interface ScrapeResult {
@@ -88,6 +90,8 @@ export class ProfileScraper {
     private readonly pool: IdentityPool,
     private readonly logger: FastifyBaseLogger,
     private readonly sessions: HttpSessionManager,
+    /** Whether to fall back to the unauthenticated public page. */
+    private readonly enablePublicFallback = true,
   ) {
     this.transport = new HttpTransport(sessions);
   }
@@ -121,7 +125,21 @@ export class ProfileScraper {
           }
 
           if (error.code === 'UPSTREAM_BLOCKED' || error.code === 'AUTH_FAILED') {
-            this.logger.warn({ strategy: strategy.name, code: error.code }, 'blocked upstream, aborting strategy chain');
+            this.logger.warn({ strategy: strategy.name, code: error.code }, 'blocked upstream, aborting authenticated strategies');
+
+            // The public page needs no session, so it is still worth trying
+            // when the authenticated path is unavailable. Reduced data beats no
+            // answer, and meta.source says which the caller got.
+            if (this.enablePublicFallback) {
+              try {
+                const fallback = await this.viaPublicPage(publicId);
+                this.logger.info({ publicId }, 'served reduced data from the public page');
+                return fallback;
+              } catch (fallbackError) {
+                this.logger.warn({ err: fallbackError, publicId }, 'public fallback also failed');
+              }
+            }
+
             throw error;
           }
 
@@ -187,6 +205,40 @@ export class ProfileScraper {
   }
 
   // ─── Legacy profileView ────────────────────────────────────────────────────
+
+  /**
+   * Reads the public profile page with no session at all.
+   *
+   * Deliberately last, and deliberately marked: LinkedIn masks most free text
+   * for logged-out viewers, so this returns a fraction of the authenticated
+   * response. `meta.source` is `public` and `meta.missingSections` lists what
+   * is unavailable, so a consumer is never misled into treating reduced data as
+   * complete.
+   */
+  private async viaPublicPage(publicId: string): Promise<ScrapeResult> {
+    const html = await fetchPublicProfile(publicId);
+    const parsed = parsePublicProfile(html);
+
+    if (!parsed) {
+      throw new ApiError('PARSE_FAILED', 'The public profile page carried no structured profile data.', {
+        details: { publicId },
+      });
+    }
+
+    if (parsed.maskedFields.length > 0) {
+      this.logger.debug({ publicId, masked: parsed.maskedFields.length }, 'public page masked fields for logged-out viewing');
+    }
+
+    return {
+      source: 'public',
+      missingSections: [...new Set([...parsed.missingSections, ...parsed.maskedFields])],
+      profile: profileSchema.parse({
+        ...parsed.profile,
+        publicId,
+        profileUrl: publicProfileUrl(publicId),
+      }),
+    };
+  }
 
   private async viaProfileView(publicId: string): Promise<ScrapeResult> {
     return this.pool.run(async (identity) => {

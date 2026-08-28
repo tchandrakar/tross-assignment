@@ -134,6 +134,8 @@ jobs:
           SESSION_IDENTITIES=${{ secrets.SESSION_IDENTITIES }}
           LI_EMAIL=${{ secrets.LI_EMAIL }}
           LI_PASSWORD=${{ secrets.LI_PASSWORD }}
+          ALLOW_AUTO_LOGIN=${{ vars.ALLOW_AUTO_LOGIN || 'false' }}
+          ENABLE_PUBLIC_FALLBACK=true
           LOG_LEVEL=info
           CACHE_ENABLED=true
           CACHE_TTL_SECONDS=604800

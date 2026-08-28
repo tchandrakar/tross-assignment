@@ -54,6 +54,25 @@ const envSchema = z.object({
    * the blob store behind IAM.
    */
   SESSION_IDENTITIES: z.string().default(''),
+  /**
+   * Whether the service may sign in to LinkedIn by itself.
+   *
+   * Off by default, and that default is deliberate. A sign-in from a datacenter
+   * address is challenged nearly every time, and repeated challenged sign-ins
+   * are what gets an account restricted. The deployed service should consume a
+   * session established elsewhere — from a network LinkedIn already trusts —
+   * and never authenticate on its own.
+   *
+   * Turn it on for local development, where sign-ins come from a residential
+   * address, or in production once a residential proxy is configured.
+   */
+  ALLOW_AUTO_LOGIN: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
+  /**
+   * Whether to fall back to the unauthenticated public profile page when no
+   * session is available. Substantially reduced data, but the API degrades
+   * instead of failing.
+   */
+  ENABLE_PUBLIC_FALLBACK: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
 
   PROXY_URLS: z.string().default(''),
   PROXY_STICKY_TEMPLATE: z.string().default(''),
@@ -166,6 +185,8 @@ function buildConfig() {
     loginEmail: env.LI_EMAIL.trim(),
     loginPassword: env.LI_PASSWORD,
     identityLabel: env.IDENTITY_LABEL,
+    allowAutoLogin: env.ALLOW_AUTO_LOGIN,
+    enablePublicFallback: env.ENABLE_PUBLIC_FALLBACK,
 
     proxyUrls: splitList(env.PROXY_URLS),
     proxyStickyTemplate: env.PROXY_STICKY_TEMPLATE.trim(),

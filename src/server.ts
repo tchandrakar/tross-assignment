@@ -67,8 +67,8 @@ export async function buildServer(config: AppConfig = getConfig()): Promise<Buil
 
   // One session manager, one transport: direct HTTP to LinkedIn. No browser is
   // launched anywhere in this service.
-  const sessions = new HttpSessionManager(app.log, sessionStore, credentials);
-  const scraper = new ProfileScraper(pool, app.log, sessions);
+  const sessions = new HttpSessionManager(app.log, sessionStore, credentials, config.allowAutoLogin);
+  const scraper = new ProfileScraper(pool, app.log, sessions, config.enablePublicFallback);
   const service = new ProfileService(scraper, cache, limiter, config, app.log);
 
   registerApiKeyAuth(app, config);

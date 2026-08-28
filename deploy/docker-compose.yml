@@ -24,11 +24,16 @@ services:
       SCRAPE_RATE_PER_MINUTE: ${SCRAPE_RATE_PER_MINUTE:-5}
       CLIENT_RATE_PER_MINUTE: ${CLIENT_RATE_PER_MINUTE:-10}
       GLOBAL_RATE_PER_MINUTE: ${GLOBAL_RATE_PER_MINUTE:-20}
-      # Credentials for automatic session bootstrap. The service uses them only
-      # when it has no valid stored session — normally never, because the
-      # session in GCS survives redeploys.
+      # Credentials, used ONLY if ALLOW_AUTO_LOGIN is true. It is false by
+      # default: a sign-in from a datacenter address is challenged nearly every
+      # time, and repeated challenged sign-ins are what gets an account
+      # restricted. The deployed service consumes a session established from a
+      # trusted network instead.
       LI_EMAIL: ${LI_EMAIL:-}
       LI_PASSWORD: ${LI_PASSWORD:-}
+      ALLOW_AUTO_LOGIN: ${ALLOW_AUTO_LOGIN:-false}
+      # Fall back to the public profile page when no session is available.
+      ENABLE_PUBLIC_FALLBACK: ${ENABLE_PUBLIC_FALLBACK:-true}
       API_KEYS: ${API_KEYS:-}
       PROXY_URLS: ${PROXY_URLS:-}
       PROXY_STICKY_TEMPLATE: ${PROXY_STICKY_TEMPLATE:-}

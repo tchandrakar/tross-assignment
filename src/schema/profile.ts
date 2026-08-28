@@ -168,6 +168,12 @@ export const sourceSchema = z.enum([
   'voyager-dash',
   /** Legacy REST profile view. Withdrawn upstream; retained as a fallback. */
   'voyager-profile-view',
+  /**
+   * The public profile page, read without a session. Substantially reduced:
+   * LinkedIn masks most free text for logged-out viewers. Reported so a
+   * consumer can tell degraded data from complete data.
+   */
+  'public',
   /** Served from the cache without contacting LinkedIn. */
   'cache',
 ]);
